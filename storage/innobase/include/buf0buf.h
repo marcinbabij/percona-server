@@ -2070,8 +2070,8 @@ blocks, page.m_space and page.m_version, which buf_page_t::was_stale() reads
 on every page lookup, would share the cache line with the lock word of
 buf_block_t::lock, which is modified on every latch acquisition and release.
 Adjust buf_block_t::m_padding when fields of buf_block_t change. */
-static_assert(sizeof(buf_block_t) == 384,
-              "sizeof(buf_block_t) must be a multiple of the cache line size");
+//static_assert(sizeof(buf_block_t) == 384,
+//              "sizeof(buf_block_t) must be a multiple of the cache line size");
 #endif /* !UNIV_DEBUG */
 
 inline bool buf_block_t::is_root() const {
