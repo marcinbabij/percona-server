@@ -14,6 +14,15 @@ if (!$custom_column_family)
 CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
 INSERT INTO clone_r VALUES (7);
 INSERT INTO clone_i VALUES (7);
+if ($large_file)
+{
+  ALTER TABLE clone_r ADD COLUMN payload LONGBLOB;
+  UPDATE clone_r SET payload=REPEAT('x', 1024*1024);
+  INSERT INTO clone_r VALUES (8, REPEAT('x', 1024*1024));
+  INSERT INTO clone_r VALUES (9, REPEAT('x', 1024*1024));
+  INSERT INTO clone_r VALUES (10, REPEAT('x', 1024*1024));
+  SET GLOBAL rocksdb_force_flush_memtable_now = ON;
+}
 --connect (recipient,127.0.0.1,root,,test,$SERVER_PORT_2)
 --source include/have_rocksdb.inc
 --source ../include/ps11475_suppress.inc
@@ -41,6 +50,10 @@ if (!$clone_workers)
 USE test;
 SELECT * FROM clone_i;
 SELECT id FROM clone_r ORDER BY id;
+if ($large_file)
+{
+  SELECT id, LENGTH(payload), SHA2(payload, 256) FROM clone_r ORDER BY id;
+}
 --let $assert_text = Provisioning must open the donor's column families and retain its rows
 --let $assert_cond = `SELECT (SELECT COUNT(*) FROM clone_i WHERE id=7)=1 AND (SELECT COUNT(*) FROM clone_r WHERE id=7)=1`
 --source include/assert.inc

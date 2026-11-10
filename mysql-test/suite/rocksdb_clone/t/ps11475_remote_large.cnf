@@ -1,0 +1,13 @@
+[mysqld]
+max-allowed-packet=2097152
+rocksdb-default-cf-options=compression=kNoCompression;write_buffer_size=16777216;target_file_size_base=16777216
+
+[mysqld.1]
+server_id=1
+
+[mysqld.2]
+server_id=2
+
+[ENV]
+SERVER_PORT_2 = @mysqld.2.port
+SERVER_SOCK_2 = @mysqld.2.socket

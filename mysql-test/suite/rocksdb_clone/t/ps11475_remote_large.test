@@ -1,0 +1,4 @@
+# A RocksDB SST larger than max_allowed_packet must be streamed in chunks.
+--let $custom_column_family = 0
+--let $large_file = 1
+--source ../include/ps11475_provision.inc

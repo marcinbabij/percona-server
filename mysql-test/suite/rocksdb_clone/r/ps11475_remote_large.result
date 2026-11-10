@@ -1,0 +1,40 @@
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO clone_r VALUES (7);
+INSERT INTO clone_i VALUES (7);
+ALTER TABLE clone_r ADD COLUMN payload LONGBLOB;
+UPDATE clone_r SET payload=REPEAT('x', 1024*1024);
+INSERT INTO clone_r VALUES (8, REPEAT('x', 1024*1024));
+INSERT INTO clone_r VALUES (9, REPEAT('x', 1024*1024));
+INSERT INTO clone_r VALUES (10, REPEAT('x', 1024*1024));
+SET GLOBAL rocksdb_force_flush_memtable_now = ON;
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+CREATE TABLE old_recipient (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO old_recipient VALUES (99);
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+SET GLOBAL clone_valid_donor_list = '127.0.0.1:PORT';
+CLONE INSTANCE FROM 'root'@'127.0.0.1':PORT IDENTIFIED BY '';
+# restart:
+USE test;
+SELECT * FROM clone_i;
+id
+7
+SELECT id FROM clone_r ORDER BY id;
+id
+7
+8
+9
+10
+SELECT id, LENGTH(payload), SHA2(payload, 256) FROM clone_r ORDER BY id;
+id	LENGTH(payload)	SHA2(payload, 256)
+7	1048576	8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b
+8	1048576	8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b
+9	1048576	8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b
+10	1048576	8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b
+include/assert.inc [Provisioning must open the donor's column families and retain its rows]
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;

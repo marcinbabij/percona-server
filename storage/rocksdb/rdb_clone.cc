@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <mutex>
 #include <memory>
+#include <limits>
 #include <unordered_set>
 #include <string>
 #include <unordered_map>
@@ -41,8 +42,13 @@ namespace myrocks {
 
 /* Magic value embedded in every locator blob so we can detect corruption. */
 static const uint32_t RDB_CLONE_LOCATOR_MAGIC = 0x524B4C4F;  /* "RKLO" */
-static const uint32_t RDB_CLONE_VERSION = 1;
-static const uint32_t RDB_CLONE_DESC_VERSION = 1;
+static const uint32_t RDB_CLONE_VERSION = 2;
+static const uint32_t RDB_CLONE_DESC_VERSION = 2;
+
+/** Largest payload sent with one descriptor. Bounds the network packet and
+the copy buffer independently of the SST size; the recipient rejects larger
+chunks. It must stay below the minimum max_allowed_packet accepted by clone. */
+static constexpr uint32_t RDB_CLONE_CHUNK_SIZE = 1024 * 1024;
 
 /* Binary layout of the opaque locator blob the clone plugin passes back
    to us on every subsequent call.  Must be POD and have stable layout. */
@@ -53,12 +59,24 @@ struct Rdb_clone_locator {
   uint32_t session_id;
 };
 
-/* Per-file descriptor serialized by clone_copy and deserialized in
-   clone_apply.  rel_path is relative to the checkpoint root. */
+/** Per-chunk descriptor serialized by clone_copy and deserialized in
+clone_apply. Each file is sent as a sequence of chunks in file order, and
+files are sent in file_index order, all by the master task. */
 struct Rdb_clone_data_desc {
+  /** RDB_CLONE_DESC_VERSION */
   uint32_t version;
+  /** Position of the file in the donor checkpoint list */
   uint32_t file_index;
+  /** Size of the whole file */
   uint64_t file_size;
+  /** File offset of the chunk payload */
+  uint64_t offset;
+  /** Payload length, at most RDB_CLONE_CHUNK_SIZE; zero only for an empty
+  file, which is sent as one empty chunk */
+  uint32_t data_size;
+  /** Number of files in the donor checkpoint */
+  uint32_t file_count;
+  /** NUL terminated flat file name in the checkpoint root */
   char rel_path[FN_REFLEN];
 };
 #pragma pack(pop)
@@ -99,6 +117,18 @@ struct Rdb_clone_apply_session : Rdb_clone_tasks {
   std::string rocksdb_dir;   /* final destination */
   std::string write_dir;     /* where files are written during apply */
   bool is_provisioning;      /* true when data_dir was nullptr */
+  /** Number of files announced by the donor, zero before the first chunk */
+  uint32_t file_count{0};
+  /** file_index expected in the next chunk */
+  uint32_t next_file{0};
+  /** Size of current_file */
+  uint64_t file_size{0};
+  /** Offset expected in the next chunk */
+  uint64_t next_offset{0};
+  /** File being received, empty between files */
+  std::string current_file;
+  /** Names of all files started, to reject a file sent twice */
+  std::unordered_set<std::string> received_names;
 };
 
 /** Completion marker appended to a receive directory path. Its presence in a
@@ -498,28 +528,31 @@ int rocksdb_clone_copy(handlerton *hton, THD *, const uchar *loc,
     snprintf(desc.rel_path, sizeof(desc.rel_path), "%s",
              files[idx].rel_path.c_str());
 
-    cbk->set_data_desc(reinterpret_cast<const uchar *>(&desc), sizeof(desc));
+    desc.file_count = static_cast<uint32_t>(files.size());
     cbk->set_source_name(full_path.c_str());
     cbk->clear_flags();
     cbk->set_os_buffer_cache();
 
-    if (file_size > static_cast<uint64_t>(UINT_MAX)) {
-      my_error(ER_GET_ERRMSG, MYF(0), 1,
-               "RocksDB clone: file exceeds 4 GiB transfer limit", "rocksdb");
-      return HA_EXIT_FAILURE;
-    }
-
     const File fd = my_open(full_path.c_str(), O_RDONLY, MYF(MY_WME));
     if (fd < 0) return HA_EXIT_FAILURE;
-
     Ha_clone_file clone_file{};
     clone_file.type = Ha_clone_file::FILE_DESC;
     clone_file.file_desc = fd;
-
-    const int err = cbk->file_cbk(clone_file, static_cast<uint>(file_size));
-    my_close(fd, MYF(0));
-    LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                    "RocksDB clone_copy: file_cbk[%u] returned %d", idx, err);
+    const uint32_t client_size = cbk->get_client_buffer_size();
+    const uint32_t chunk_size = client_size == 0 ? RDB_CLONE_CHUNK_SIZE :
+        std::min(client_size, RDB_CLONE_CHUNK_SIZE);
+    uint64_t offset = 0;
+    int err = 0;
+    do {
+      desc.offset = offset;
+      desc.data_size = static_cast<uint32_t>(
+          std::min<uint64_t>(file_size - offset, chunk_size));
+      cbk->set_data_desc(reinterpret_cast<const uchar *>(&desc), sizeof(desc));
+      err = cbk->file_cbk(clone_file, desc.data_size);
+      if (err != 0) break;
+      offset += desc.data_size;
+    } while (offset < file_size);
+    if (my_close(fd, MYF(MY_WME)) != 0 && err == 0) err = clone_io_error();
     if (err != 0) return err;
   }
 
@@ -620,6 +653,7 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
 
   /* Remove any leftover staging dir from a previous failed attempt. */
   if (is_provisioning) {
+    if (clone_is_complete(write_dir)) return clone_protocol_error();
     remove_clone_stage(write_dir);
   }
 
@@ -650,7 +684,7 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
 }
 
 int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
-                        uint, int in_err, Ha_clone_cbk *cbk) {
+                        uint task_id, int in_err, Ha_clone_cbk *cbk) {
   if (in_err != 0) return in_err;
   if (!validate_locator(loc, loc_len)) return HA_EXIT_FAILURE;
 
@@ -662,12 +696,23 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
   if (desc->version != RDB_CLONE_DESC_VERSION ||
       !valid_clone_filename(desc->rel_path, sizeof(desc->rel_path)))
     return clone_protocol_error();
-  const uint64_t expected_size = desc->file_size;
+  if (desc->file_count == 0 || desc->file_index >= desc->file_count ||
+      desc->data_size > RDB_CLONE_CHUNK_SIZE ||
+      desc->offset > desc->file_size ||
+      desc->data_size > desc->file_size - desc->offset ||
+      (desc->data_size == 0 && desc->file_size != 0) ||
+      desc->file_size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
+    return clone_protocol_error();
+  const uint64_t offset = desc->offset;
+  const uint64_t next_offset = offset + desc->data_size;
+  const bool last_chunk = next_offset == desc->file_size;
 
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB clone_apply: file '%s' size=%llu",
-                  desc->rel_path,
-                  static_cast<unsigned long long>(desc->file_size));
+  /* Called once per chunk: log only file boundaries and failures. */
+  if (offset == 0)
+    LogPluginErrMsg(INFORMATION_LEVEL, 0,
+                    "RocksDB clone_apply: file '%s' size=%llu",
+                    desc->rel_path,
+                    static_cast<unsigned long long>(desc->file_size));
 
   const uint32_t sid = locator_session_id(loc);
 
@@ -680,42 +725,78 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
                       "RocksDB clone_apply: session %u not found!", sid);
       return HA_EXIT_FAILURE;
     }
-    write_dir = it->second.write_dir;
+    auto &session = it->second;
+    if (task_id != 0 || session.active.count(task_id) == 0 ||
+        desc->file_index != session.next_file ||
+        offset != session.next_offset ||
+        (session.file_count != 0 && session.file_count != desc->file_count))
+      return clone_protocol_error();
+    if (session.current_file.empty()) {
+      if (offset != 0 || !session.received_names.insert(desc->rel_path).second)
+        return clone_protocol_error();
+      session.current_file = desc->rel_path;
+      session.file_size = desc->file_size;
+      session.file_count = desc->file_count;
+    } else if (session.current_file != desc->rel_path ||
+               session.file_size != desc->file_size) {
+      return clone_protocol_error();
+    }
+    write_dir = session.write_dir;
   }
 
   const std::string dest_path = write_dir + "/" + desc->rel_path;
   cbk->set_dest_name(dest_path.c_str());
 
-  const File dest_fd =
-      my_open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, MYF(MY_WME));
+  const int open_flags = O_WRONLY | O_NOFOLLOW |
+                         (offset == 0 ? O_CREAT | O_EXCL : 0);
+  const File dest_fd = my_open(dest_path.c_str(), open_flags, MYF(MY_WME));
   if (dest_fd < 0) return HA_EXIT_FAILURE;
+  if (my_seek(dest_fd, offset, MY_SEEK_SET, MYF(MY_WME)) == MY_FILEPOS_ERROR) {
+    my_close(dest_fd, MYF(0));
+    return clone_io_error();
+  }
 
   Ha_clone_file dest_file{};
   dest_file.type = Ha_clone_file::FILE_DESC;
   dest_file.file_desc = dest_fd;
 
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB clone_apply: calling apply_file_cbk for '%s'",
-                  desc->rel_path);
   int err = cbk->apply_file_cbk(dest_file);
   if (err == 0 && my_seek(dest_fd, 0, MY_SEEK_CUR, MYF(MY_WME)) !=
-                      expected_size)
+                      next_offset)
     err = clone_protocol_error();
-  if (err == 0 && my_sync(dest_fd, MYF(MY_WME)) != 0)
+  if (err == 0 && last_chunk && my_sync(dest_fd, MYF(MY_WME)) != 0)
     err = clone_io_error();
   if (my_close(dest_fd, MYF(MY_WME)) != 0 && err == 0)
     err = clone_io_error();
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB clone_apply: apply_file_cbk for '%s' returned %d",
-                  desc->rel_path, err);
+  if (err != 0 || last_chunk)
+    LogPluginErrMsg(INFORMATION_LEVEL, 0,
+                    "RocksDB clone_apply: apply_file_cbk for '%s' returned %d",
+                    desc->rel_path, err);
+  {
+    std::lock_guard<std::mutex> guard(g_clone_mutex);
+    /* The session cannot be erased meanwhile: only the master task 0
+    applies, and it is still active until its own apply_end. */
+    auto &session = g_apply_sessions.at(sid);
+    if (err != 0) session.error = err;
+    else if (last_chunk) {
+      ++session.next_file;
+      session.next_offset = 0;
+      session.current_file.clear();
+    } else session.next_offset = next_offset;
+  }
   return err;
 }
 
 int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
                             uint loc_len, uint task_id, int in_err) {
+  /* Held until the stage is published or removed. The session is erased
+  first, and a new provisioning receive started meanwhile would otherwise
+  remove the same stage directory in its apply_begin. */
+  std::lock_guard<std::mutex> guard(g_clone_mutex);
   std::string rocksdb_dir;
   std::string write_dir;
   bool is_provisioning = false;
+  const int input_error = in_err;
 
   if (validate_locator(loc, loc_len)) {
     const uint32_t sid = locator_session_id(loc);
@@ -723,13 +804,15 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
       delete[] loc;
       return 0;
     }
-    std::lock_guard<std::mutex> guard(g_clone_mutex);
     const auto it = g_apply_sessions.find(sid);
     if (it != g_apply_sessions.end()) {
       if (it->second.active.erase(task_id) != 1) return ER_CLONE_PROTOCOL;
       if (in_err != 0) it->second.error = in_err;
       if (!it->second.active.empty()) return 0;
       in_err = it->second.error;
+      if (in_err == 0 && (it->second.file_count == 0 ||
+                         it->second.next_file != it->second.file_count))
+        in_err = clone_protocol_error();
       rocksdb_dir = it->second.rocksdb_dir;
       write_dir = it->second.write_dir;
       is_provisioning = it->second.is_provisioning;
@@ -738,7 +821,7 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
   }
 
   if (!is_provisioning || write_dir.empty() || rocksdb_dir.empty()) {
-    return 0;
+    return input_error == 0 ? in_err : 0;
   }
 
   if (in_err != 0) {
@@ -747,7 +830,7 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
                     "RocksDB clone_apply_end: clone error %d, "
                     "removing staging dir %s", in_err, write_dir.c_str());
     remove_clone_stage(write_dir);
-    return 0;
+    return input_error == 0 ? in_err : 0;
   }
 
   /* Publish completion only after the received files and directory entries
