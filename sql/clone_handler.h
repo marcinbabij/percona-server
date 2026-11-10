@@ -155,6 +155,8 @@ class Clone_handler {
    private:
     /** If blocking is successful and there is no XA operations. */
     bool m_success;
+    /** False when a global commit lock already excludes XA changes. */
+    bool m_owns_block;
   };
 
  private:

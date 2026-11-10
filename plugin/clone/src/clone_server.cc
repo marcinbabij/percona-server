@@ -147,6 +147,8 @@ int Server::init_storage(Ha_clone_mode mode, uchar *com_buf, size_t com_len) {
   }
 
   if (m_is_master) {
+    err = m_read_lock.acquire(thd, m_client_ddl_timeout);
+    if (err != 0) return err;
     /* Set statement type for master thread */
     mysql_service_clone_protocol->mysql_clone_start_statement(
         thd, PSI_NOT_INSTRUMENTED, clone_stmt_server_key);

@@ -98,6 +98,12 @@ int Local::clone_exec() {
   Task_Vector server_tasks;
   server_tasks.reserve(MAX_CLONE_STORAGE_ENGINE);
 
+  Clone_read_lock read_lock;
+  if (is_master) {
+    const auto err = read_lock.acquire(thd, clone_ddl_timeout);
+    if (err != 0) return err;
+  }
+
   /* Acquire DDL lock. Wait for 5 minutes by default. */
   if (acquire_backup_lock) {
     auto failed = mysql_service_mysql_backup_lock->acquire(

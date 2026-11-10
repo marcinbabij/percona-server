@@ -1,0 +1,71 @@
+# A counted XA COMMIT waiting for the donor commit lock must not deadlock
+# the final InnoDB snapshot. InnoDB retains the prepared XA while MyRocks
+# retains its committed row. Detached MyRocks XA has a separate lifetime bug.
+--source include/have_rocksdb.inc
+--source ../include/ps11475_suppress.inc
+--disable_query_log
+CALL mtr.add_suppression('Found 1 prepared XA transactions');
+--enable_query_log
+--source include/have_debug_sync.inc
+--let $port = `SELECT @@port`
+--replace_result $CLONE_PLUGIN CLONE_PLUGIN
+--eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN'
+CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO clone_i VALUES (1);
+INSERT INTO clone_r VALUES (1);
+XA START 'ps11475';
+INSERT INTO clone_i VALUES (3);
+XA END 'ps11475';
+XA PREPARE 'ps11475';
+--connect (recipient,127.0.0.1,root,,test,$SERVER_PORT_2)
+--replace_result $CLONE_PLUGIN CLONE_PLUGIN
+--eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN'
+--disable_query_log
+CALL mtr.add_suppression('Clone removing all user data for provisioning');
+CALL mtr.add_suppression('Restart server failed');
+CALL mtr.add_suppression('Shutting down server after clone');
+--enable_query_log
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+--replace_result $port PORT
+--eval SET GLOBAL clone_valid_donor_list = '127.0.0.1:$port'
+SET DEBUG_SYNC = 'clone_file_copy_end_before_ack SIGNAL snapshot_paused WAIT_FOR finish_clone';
+--source include/expect_crash.inc
+--replace_result $port PORT
+--send_eval CLONE INSTANCE FROM 'root'@'127.0.0.1':$port IDENTIFIED BY ''
+--connect (control,127.0.0.1,root,,test,$SERVER_PORT_2)
+SET DEBUG_SYNC = 'now WAIT_FOR snapshot_paused';
+--connection default
+--send XA COMMIT 'ps11475'
+--connect (observer,127.0.0.1,root,,test,$port)
+--let $wait_condition = SELECT COUNT(*) > 0 FROM performance_schema.metadata_locks WHERE OBJECT_TYPE='COMMIT' AND LOCK_STATUS='PENDING'
+--source include/wait_condition.inc
+--disconnect observer
+--connection control
+SET DEBUG_SYNC = 'now SIGNAL finish_clone';
+--disconnect control
+--connection default
+--reap
+--connection recipient
+--error 0,ER_RESTART_SERVER_FAILED,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
+--reap
+--source include/wait_until_disconnected.inc
+--let $restart_parameters = restart:
+--source include/start_mysqld.inc
+USE test;
+SELECT * FROM clone_i ORDER BY id;
+SELECT * FROM clone_r ORDER BY id;
+XA RECOVER;
+XA COMMIT 'ps11475';
+SELECT * FROM clone_i ORDER BY id;
+SELECT * FROM clone_r ORDER BY id;
+--let $assert_text = InnoDB must recover the prepared transaction and MyRocks its committed row
+--let $assert_cond = `SELECT (SELECT COUNT(*) FROM clone_i WHERE id=3)=1 AND (SELECT COUNT(*) FROM clone_r WHERE id=1)=1`
+--source include/assert.inc
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;
+--disconnect recipient
+--connection default
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;

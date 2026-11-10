@@ -39,6 +39,38 @@ Clone Plugin: Interface with SE handlerton
 
 /* Namespace for all clone data types */
 namespace myclone {
+/** Hold a common, non-moving transaction boundary for blocking engines.
+A blocking engine (HA_CLONE_BLOCKING without HA_CLONE_HYBRID) copies a
+snapshot taken at clone begin, while InnoDB copies up to its redo end point.
+Without a global read lock that also blocks commits, a transaction committed
+in between would be present in InnoDB and in the cloned GTID set, but absent
+from the blocking engine. The donor master owns this guard until all engines
+finish copying, so donor writes stay blocked for the whole clone. A donor
+without any blocking engine installed keeps the online InnoDB-only behaviour.
+*/
+class Clone_read_lock {
+ public:
+  Clone_read_lock() = default;
+  Clone_read_lock(const Clone_read_lock &) = delete;
+  Clone_read_lock &operator=(const Clone_read_lock &) = delete;
+
+  /** Release the global read lock, if acquire() took it. */
+  ~Clone_read_lock();
+
+  /** Take the global read lock and block commits, in the FTWRL order, if any
+  installed storage engine needs a blocking clone. Does nothing otherwise.
+  On failure, the lock taken so far is released by the destructor.
+  @param[in,out]  thd      donor master thread, must not be in LOCK TABLES
+                           or in an active multi-statement transaction
+  @param[in]      timeout  lock wait timeout in seconds
+  @return 0 on success, otherwise an error code reported to the session */
+  int acquire(THD *thd, unsigned long timeout);
+
+ private:
+  /** Thread which took the lock, nullptr when not owned. Stays nullptr when
+  the session already held the global read lock before the clone. */
+  THD *m_owner{nullptr};
+};
 
 struct Locator {
   /** Get buffer length for serilized locator.

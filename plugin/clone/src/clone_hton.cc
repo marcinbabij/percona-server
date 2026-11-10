@@ -28,9 +28,61 @@ Clone Plugin: Interface with SE handlerton
 */
 
 #include "plugin/clone/include/clone_hton.h"
+#include "scope_guard.h"
+#include "sql/sql_base.h"
+#include "sql/sql_class.h"
 
 /* Namespace for all clone data types */
 namespace myclone {
+/** Check if a storage engine copies a snapshot only consistent while donor
+commits are blocked. plugin_foreach() callback.
+@param[in]      plugin  storage engine plugin
+@param[in,out]  arg     bool flag, set to true for a blocking engine
+@return false, to continue with the next plugin */
+static bool needs_read_lock(THD *, plugin_ref plugin, void *arg) {
+  const auto hton = plugin_data<handlerton *>(plugin);
+  if (hton->clone_interface.clone_begin != nullptr) {
+    Ha_clone_flagset flags;
+    hton->clone_interface.clone_capability(flags);
+    if (flags[HA_CLONE_BLOCKING] && !flags[HA_CLONE_HYBRID])
+      *static_cast<bool *>(arg) = true;
+  }
+  return false;
+}
+
+int Clone_read_lock::acquire(THD *thd, unsigned long timeout) {
+  bool blocking = false;
+  plugin_foreach(thd, needs_read_lock, MYSQL_STORAGE_ENGINE_PLUGIN, &blocking);
+  if (!blocking) return 0;
+  if (thd->locked_tables_mode || thd->in_active_multi_stmt_transaction()) {
+    my_error(ER_LOCK_OR_ACTIVE_TRANSACTION, MYF(0));
+    return ER_LOCK_OR_ACTIVE_TRANSACTION;
+  }
+
+  const auto saved_timeout = thd->variables.lock_wait_timeout;
+  thd->variables.lock_wait_timeout = timeout;
+  auto restore_timeout = create_scope_guard(
+      [&]() { thd->variables.lock_wait_timeout = saved_timeout; });
+  const bool already_locked = thd->global_read_lock.is_acquired();
+  if (thd->global_read_lock.lock_global_read_lock(thd))
+    return thd->get_stmt_da()->mysql_errno();
+  if (!already_locked) m_owner = thd;
+
+  /* Match FTWRL ordering: drain table users before blocking commits.
+  Otherwise an update waiting for a row lock can prevent the transaction
+  holding that row lock from committing. Both engines and the persisted
+  GTIDs must remain at this boundary until copying has finished. */
+  if (close_cached_tables(thd, nullptr, true, timeout) ||
+      thd->global_read_lock.make_global_read_lock_block_commit(thd))
+    return thd->get_stmt_da()->mysql_errno();
+  return 0;
+}
+
+Clone_read_lock::~Clone_read_lock() {
+  if (m_owner != nullptr)
+    m_owner->global_read_lock.unlock_global_read_lock(m_owner);
+}
+
 /** Structure to pass clone information to each storage plugin */
 struct Hton {
   /** Clone locator vector */

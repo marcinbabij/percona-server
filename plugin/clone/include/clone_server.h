@@ -206,6 +206,9 @@ class Server {
   /** Server thread object */
   THD *m_server_thd;
 
+  /** A blocking engine's snapshot also freezes InnoDB and GTID state. */
+  Clone_read_lock m_read_lock;
+
   /** If this is the master task */
   bool m_is_master;
 

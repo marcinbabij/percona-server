@@ -1,0 +1,65 @@
+# A blocking engine freezes writes and DDL until every engine has copied.
+# Existing recipient synchronization holds the clone after RocksDB checkpoint.
+--source include/have_rocksdb.inc
+--source ../include/ps11475_suppress.inc
+--source include/have_debug_sync.inc
+--let $port = `SELECT @@port`
+--replace_result $CLONE_PLUGIN CLONE_PLUGIN
+--eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN'
+CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO clone_i VALUES (1);
+INSERT INTO clone_r VALUES (1);
+--connect (recipient,127.0.0.1,root,,test,$SERVER_PORT_2)
+--replace_result $CLONE_PLUGIN CLONE_PLUGIN
+--eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN'
+--disable_query_log
+CALL mtr.add_suppression('Clone removing all user data for provisioning');
+CALL mtr.add_suppression('Restart server failed');
+CALL mtr.add_suppression('Shutting down server after clone');
+--enable_query_log
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+--replace_result $port PORT
+--eval SET GLOBAL clone_valid_donor_list = '127.0.0.1:$port'
+SET DEBUG_SYNC = 'clone_file_copy_end_before_ack SIGNAL snapshot_paused WAIT_FOR finish_clone';
+--source include/expect_crash.inc
+--replace_result $port PORT
+--send_eval CLONE INSTANCE FROM 'root'@'127.0.0.1':$port IDENTIFIED BY ''
+--connect (control,127.0.0.1,root,,test,$SERVER_PORT_2)
+SET DEBUG_SYNC = 'now WAIT_FOR snapshot_paused';
+--connection default
+SET SESSION lock_wait_timeout = 1;
+--error ER_LOCK_WAIT_TIMEOUT
+INSERT INTO clone_i VALUES (2);
+--error ER_LOCK_WAIT_TIMEOUT
+INSERT INTO clone_r VALUES (2);
+--error ER_LOCK_WAIT_TIMEOUT
+ALTER TABLE clone_r ADD COLUMN extra INT;
+--let $committed_gtids = `SELECT @@GLOBAL.gtid_executed`
+--connection control
+SET DEBUG_SYNC = 'now SIGNAL finish_clone';
+--disconnect control
+--connection recipient
+--error 0,ER_RESTART_SERVER_FAILED,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
+--reap
+--source include/wait_until_disconnected.inc
+--let $restart_parameters = restart:
+--source include/start_mysqld.inc
+USE test;
+SELECT * FROM clone_i ORDER BY id;
+SELECT * FROM clone_r ORDER BY id;
+--replace_result $committed_gtids GTIDS
+--eval SELECT GTID_SUBSET('$committed_gtids', @@GLOBAL.gtid_executed) AS committed_gtids_present
+--let $assert_text = Both engines must retain the same state under the donor read lock
+--let $assert_cond = `SELECT (SELECT COUNT(*) FROM clone_i)=(SELECT COUNT(*) FROM clone_r)`
+--source include/assert.inc
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;
+--disconnect recipient
+--connection default
+SET SESSION lock_wait_timeout = DEFAULT;
+INSERT INTO clone_i VALUES (2);
+INSERT INTO clone_r VALUES (2);
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;

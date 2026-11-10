@@ -1,0 +1,42 @@
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO clone_i VALUES (1);
+INSERT INTO clone_r VALUES (1);
+XA START 'ps11475';
+INSERT INTO clone_i VALUES (3);
+XA END 'ps11475';
+XA PREPARE 'ps11475';
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+SET GLOBAL clone_valid_donor_list = '127.0.0.1:PORT';
+SET DEBUG_SYNC = 'clone_file_copy_end_before_ack SIGNAL snapshot_paused WAIT_FOR finish_clone';
+CLONE INSTANCE FROM 'root'@'127.0.0.1':PORT IDENTIFIED BY '';
+SET DEBUG_SYNC = 'now WAIT_FOR snapshot_paused';
+XA COMMIT 'ps11475';
+SET DEBUG_SYNC = 'now SIGNAL finish_clone';
+# restart:
+USE test;
+SELECT * FROM clone_i ORDER BY id;
+id
+1
+SELECT * FROM clone_r ORDER BY id;
+id
+1
+XA RECOVER;
+formatID	gtrid_length	bqual_length	data
+1	7	0	ps11475
+XA COMMIT 'ps11475';
+SELECT * FROM clone_i ORDER BY id;
+id
+1
+3
+SELECT * FROM clone_r ORDER BY id;
+id
+1
+include/assert.inc [InnoDB must recover the prepared transaction and MyRocks its committed row]
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;

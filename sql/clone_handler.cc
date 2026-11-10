@@ -409,11 +409,19 @@ void Clone_handler::begin_xa_operation(THD *thd) {
 void Clone_handler::end_xa_operation() { s_xa_counter.fetch_sub(1); }
 
 Clone_handler::XA_Block::XA_Block(THD *thd) {
-  m_success = block_xa_operation(thd);
+  /* A blocking-engine clone already holds the COMMIT shared MDL lock.
+  XA PREPARE/COMMIT/ROLLBACK cannot change binlog or engines under it.
+  Do not wait for XA_Operation counters here: a counted XA COMMIT can
+  itself be waiting for our COMMIT lock, creating a circular wait. */
+  m_owns_block = !thd->mdl_context.owns_equal_or_stronger_lock(
+      MDL_key::COMMIT, "", "", MDL_SHARED);
+  m_success = !m_owns_block || block_xa_operation(thd);
   DEBUG_SYNC_C("clone_block_xa");
 }
 
-Clone_handler::XA_Block::~XA_Block() { unblock_xa_operation(); }
+Clone_handler::XA_Block::~XA_Block() {
+  if (m_owns_block) unblock_xa_operation();
+}
 
 bool Clone_handler::XA_Block::failed() const { return (!m_success); }
 
