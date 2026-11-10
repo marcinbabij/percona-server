@@ -860,7 +860,9 @@ int Client::clone() {
 
   /* Check if storage is initialized and close. */
   if (m_storage_initialized) {
-    hton_clone_apply_end(m_server_thd, m_share->m_storage_vec, m_tasks, err);
+    const auto end_error =
+        hton_clone_apply_end(m_server_thd, m_share->m_storage_vec, m_tasks, err);
+    if (err == 0) err = end_error;
 
     m_storage_initialized = false;
     m_storage_active = false;
@@ -1666,8 +1668,9 @@ int Client::set_locators(const uchar *buffer, size_t length) {
     assert(m_storage_initialized);
     assert(!m_storage_active);
 
-    hton_clone_apply_end(m_server_thd, m_share->m_storage_vec, m_tasks, 0);
+    err = hton_clone_apply_end(m_server_thd, m_share->m_storage_vec, m_tasks, 0);
     m_storage_initialized = false;
+    if (err != 0) return err;
 
     /* Check and match remote server parameters. */
     err = validate_remote_params();

@@ -1,0 +1,30 @@
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO clone_r VALUES (7);
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+CREATE DATABASE protected_schema;
+CREATE TABLE protected_schema.keep_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO protected_schema.keep_r VALUES (99);
+ALTER DATABASE protected_schema READ ONLY=1;
+ALTER DATABASE mtr READ ONLY=1;
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+SET GLOBAL clone_valid_donor_list = '127.0.0.1:PORT';
+CLONE INSTANCE FROM 'root'@'127.0.0.1':PORT IDENTIFIED BY '';
+ERROR HY000: Schema 'mtr' is in read only mode.
+CLONE INSTANCE FROM 'root'@'127.0.0.1':PORT IDENTIFIED BY '';
+ERROR HY000: Schema 'mtr' is in read only mode.
+ALTER DATABASE mtr READ ONLY=0;
+SELECT * FROM protected_schema.keep_r;
+id
+99
+# restart:
+SELECT * FROM protected_schema.keep_r;
+id
+99
+include/assert.inc [A failed clone must not replace the RocksDB database at restart]
+ALTER DATABASE protected_schema READ ONLY=0;
+DROP DATABASE protected_schema;
+UNINSTALL PLUGIN clone;
+DROP TABLE clone_r;
+UNINSTALL PLUGIN clone;

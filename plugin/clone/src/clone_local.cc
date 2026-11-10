@@ -188,10 +188,13 @@ int Local::clone_exec() {
   m_clone_client.wait_for_workers();
 
   /* End clone apply to destination. */
-  hton_clone_apply_end(thd, client_vector, client_tasks, error);
+  const auto apply_error =
+      hton_clone_apply_end(thd, client_vector, client_tasks, error);
+  if (error == 0) error = apply_error;
 
   /* End clone copy from source. */
-  hton_clone_end(thd, server_vector, server_tasks, error);
+  const auto end_error = hton_clone_end(thd, server_vector, server_tasks, error);
+  if (error == 0) error = end_error;
 
   /* Release DDL lock */
   if (acquire_backup_lock) {

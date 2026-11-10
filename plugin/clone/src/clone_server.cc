@@ -270,7 +270,7 @@ int Server::parse_command_buffer(uchar command, uchar *com_buf, size_t com_len,
 
     case COM_EXIT:
       if (m_storage_initialized) {
-        hton_clone_end(get_thd(), get_storage_vector(), m_tasks, 0);
+        err = hton_clone_end(get_thd(), get_storage_vector(), m_tasks, 0);
         m_storage_initialized = false;
       }
       done = true;

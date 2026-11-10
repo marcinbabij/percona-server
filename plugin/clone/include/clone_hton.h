@@ -147,7 +147,8 @@ using myclone::Task_Vector;
 @param[out]	task_vec		vector of task identifiers
 @param[in]	clone_type		clone type
 @param[in]	clone_mode		clone begin mode
-@return error code */
+@return error code. On failure, except in HA_CLONE_MODE_RESTART, engines
+begun by this call are ended and both vectors are restored to their input. */
 int hton_clone_begin(THD *thd, Storage_Vector &clone_loc_vec,
                      Task_Vector &task_vec, Ha_clone_type clone_type,
                      Ha_clone_mode clone_mode);
@@ -171,7 +172,8 @@ bool hton_clone_supports_restart(const Storage_Vector &locators);
 @param[in]	clone_loc_vec	vector of locators for SEs
 @param[in]	task_vec	vector of task identifiers
 @param[in]	in_err		error code when ending after error
-@return error code */
+@return first error returned by an engine. Every engine is ended; after a
+failure the remaining engines are ended with that error. */
 int hton_clone_end(THD *thd, Storage_Vector &clone_loc_vec,
                    Task_Vector &task_vec, int in_err);
 
@@ -181,7 +183,8 @@ int hton_clone_end(THD *thd, Storage_Vector &clone_loc_vec,
 @param[in,out]	clone_loc_vec		vector of locators from SEs
 @param[out]	task_vec		vector of task identifiers
 @param[in]	clone_mode		clone begin mode
-@return error code */
+@return error code. On failure, except in HA_CLONE_MODE_RESTART, engines
+begun by this call are ended and both vectors are restored to their input. */
 int hton_clone_apply_begin(THD *thd, const char *clone_data_dir,
                            Storage_Vector &clone_loc_vec, Task_Vector &task_vec,
                            Ha_clone_mode clone_mode);
@@ -191,7 +194,7 @@ int hton_clone_apply_begin(THD *thd, const char *clone_data_dir,
 @param[in]	clone_loc_vec	vector of locators for SEs
 @param[in]	task_vec	vector of task identifiers
 @param[in]	in_err		error code when ending after error
-@return error code */
+@return first error returned by an engine; every engine is notified */
 int hton_clone_apply_error(THD *thd, Storage_Vector &clone_loc_vec,
                            Task_Vector &task_vec, int in_err);
 
@@ -200,7 +203,8 @@ int hton_clone_apply_error(THD *thd, Storage_Vector &clone_loc_vec,
 @param[in]	clone_loc_vec	vector of locators for SEs
 @param[in]	task_vec	vector of task identifiers
 @param[in]	in_err		error code when ending after error
-@return error code */
+@return first error returned by an engine. Non-blocking engines are ended
+first, then blocking engines, each with the first error seen so far. */
 int hton_clone_apply_end(THD *thd, Storage_Vector &clone_loc_vec,
                          Task_Vector &task_vec, int in_err);
 
