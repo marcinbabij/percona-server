@@ -1,0 +1,3 @@
+# Control case: donor and recipient use the default column families.
+--let $custom_column_family = 0
+--source ../include/ps11475_provision.inc
