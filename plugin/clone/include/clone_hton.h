@@ -161,6 +161,11 @@ int hton_clone_begin(THD *thd, Storage_Vector &clone_loc_vec,
 int hton_clone_copy(THD *thd, Storage_Vector &clone_loc_vec,
                     Task_Vector &task_vec, Ha_clone_cbk *clone_cbk);
 
+/** Check if every participating engine can resume after a disconnect.
+@param[in]	locators	vector of locators for SEs
+@return true if all engines support HA_CLONE_RESTART */
+bool hton_clone_supports_restart(const Storage_Vector &locators);
+
 /** Clone end for all storage engines supporting clone
 @param[in,out]	thd		server thread handle
 @param[in]	clone_loc_vec	vector of locators for SEs

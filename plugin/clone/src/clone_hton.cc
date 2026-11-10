@@ -165,21 +165,13 @@ int hton_clone_begin(THD *thd, Storage_Vector &clone_loc_vec,
   for (auto &loc_iter : clone_loc_vec) {
     uint32_t task_id = 0;
 
-#if !defined(NDEBUG)
     Ha_clone_flagset flags;
-
     loc_iter.m_hton->clone_interface.clone_capability(flags);
-
-    /* TODO: Skip adding task if SE doesn't support */
-    if (clone_mode == HA_CLONE_MODE_ADD_TASK) {
-      assert(flags[HA_CLONE_MULTI_TASK]);
+    if ((clone_mode == HA_CLONE_MODE_ADD_TASK && !flags[HA_CLONE_MULTI_TASK]) ||
+        (clone_mode == HA_CLONE_MODE_RESTART && !flags[HA_CLONE_RESTART])) {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0), "Clone engine task/restart mode");
+      return ER_NOT_SUPPORTED_YET;
     }
-
-    /* TODO: Stop and start if restart not supported */
-    if (clone_mode == HA_CLONE_MODE_RESTART) {
-      assert(flags[HA_CLONE_RESTART]);
-    }
-#endif
     auto err = loc_iter.m_hton->clone_interface.clone_begin(
         loc_iter.m_hton, thd, loc_iter.m_loc, loc_iter.m_loc_len, task_id,
         clone_type, clone_mode);
@@ -215,15 +207,31 @@ int hton_clone_copy(THD *thd, Storage_Vector &clone_loc_vec,
   return (0);
 }
 
+bool hton_clone_supports_restart(const Storage_Vector &locators) {
+  for (const auto &locator : locators) {
+    Ha_clone_flagset flags;
+    locator.m_hton->clone_interface.clone_capability(flags);
+    if (!flags[HA_CLONE_RESTART]) return false;
+  }
+  return true;
+}
+
 int hton_clone_end(THD *thd, Storage_Vector &clone_loc_vec,
                    Task_Vector &task_vec, int in_err) {
   uint index = 0;
+  /* A multi-engine clone cannot resume unless every engine can resume.
+  Give engines a terminal error so InnoDB does not retain the donor lock
+  while waiting for a reconnect that the client cannot perform. */
+  const int end_error =
+      (in_err != 0 && !hton_clone_supports_restart(clone_loc_vec))
+          ? ER_CLONE_PROTOCOL
+          : in_err;
 
   for (auto &loc_iter : clone_loc_vec) {
     assert(index < task_vec.size());
     auto err = loc_iter.m_hton->clone_interface.clone_end(
         loc_iter.m_hton, thd, loc_iter.m_loc, loc_iter.m_loc_len,
-        task_vec[index], in_err);
+        task_vec[index], end_error);
 
     if (err != 0) {
       return (err);
@@ -294,21 +302,13 @@ int hton_clone_apply_begin(THD *thd, const char *clone_data_dir,
   for (auto &loc_iter : clone_loc_vec) {
     uint32_t task_id = 0;
 
-#if !defined(NDEBUG)
     Ha_clone_flagset flags;
-
     loc_iter.m_hton->clone_interface.clone_capability(flags);
-
-    /* TODO: Skip adding task if SE doesn't support */
-    if (clone_mode == HA_CLONE_MODE_ADD_TASK) {
-      assert(flags[HA_CLONE_MULTI_TASK]);
+    if ((clone_mode == HA_CLONE_MODE_ADD_TASK && !flags[HA_CLONE_MULTI_TASK]) ||
+        (clone_mode == HA_CLONE_MODE_RESTART && !flags[HA_CLONE_RESTART])) {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0), "Clone engine task/restart mode");
+      return ER_NOT_SUPPORTED_YET;
     }
-
-    /* TODO: Stop and start if restart no supported */
-    if (clone_mode == HA_CLONE_MODE_RESTART) {
-      assert(flags[HA_CLONE_RESTART]);
-    }
-#endif
     auto err = loc_iter.m_hton->clone_interface.clone_apply_begin(
         loc_iter.m_hton, thd, loc_iter.m_loc, loc_iter.m_loc_len, task_id,
         clone_mode, clone_data_dir);

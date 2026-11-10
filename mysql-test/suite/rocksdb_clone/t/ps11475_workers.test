@@ -1,0 +1,4 @@
+# Worker attachment must not abort the donor or create a fresh snapshot.
+--let $custom_column_family = 0
+--let $clone_workers = 2
+--source ../include/ps11475_provision.inc

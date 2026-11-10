@@ -777,7 +777,8 @@ int Client::clone() {
 
       /* For network error master would attempt
       to restart clone. */
-      if (is_master() && is_network_error(err, false)) {
+      if (is_master() && is_network_error(err, false) &&
+          hton_clone_supports_restart(get_storage_vector())) {
         log_error(get_thd(), true, err, "Source Network issue");
         restart = true;
       }

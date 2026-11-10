@@ -15,7 +15,11 @@ INSERT INTO clone_i VALUES (7);
 CREATE TABLE old_recipient (id INT PRIMARY KEY) ENGINE=RocksDB;
 INSERT INTO old_recipient VALUES (99);
 SET GLOBAL clone_autotune_concurrency = OFF;
-SET GLOBAL clone_max_concurrency = 1;
+if (!$clone_workers)
+{
+  --let $clone_workers = 1
+}
+--eval SET GLOBAL clone_max_concurrency = $clone_workers
 --replace_result $port PORT
 --eval SET GLOBAL clone_valid_donor_list = '127.0.0.1:$port'
 # MTR starts mysqld without a supervisor. A successful provisioning clone

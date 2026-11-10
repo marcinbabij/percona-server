@@ -18,6 +18,8 @@
 /* C++ standard headers */
 #include <atomic>
 #include <mutex>
+#include <memory>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -65,8 +67,25 @@ struct Rdb_clone_file_info {
   uint64_t file_size;
 };
 
-/* Donor-side clone session: holds the checkpoint directory and file list. */
-struct Rdb_clone_session {
+/** Tasks attached to one donor or recipient clone session. The master task
+creates the session in HA_CLONE_MODE_START and workers attach to it with
+HA_CLONE_MODE_ADD_TASK. The session, its locator and its directory are kept
+until the last attached task ends. */
+struct Rdb_clone_tasks {
+  /** Locator returned to every task. Owned by the session, so it stays valid
+  for the clone plugin until the session is erased by the last end call. */
+  std::unique_ptr<uchar[]> locator;
+  /** Identifier for the next attached worker task. */
+  uint next_task{1};
+  /** Tasks which have not ended yet. Initialized with the master task 0:
+  the braces select the initializer-list constructor, not a bucket count. */
+  std::unordered_set<uint> active{0};
+  /** First error reported by any task, used by the last task to end. */
+  int error{0};
+};
+
+/** Donor-side clone session: holds the checkpoint directory and file list. */
+struct Rdb_clone_session : Rdb_clone_tasks {
   std::string checkpoint_dir;
   std::vector<Rdb_clone_file_info> files;
 };
@@ -75,7 +94,7 @@ struct Rdb_clone_session {
    In provisioning mode (data_dir==nullptr), files are staged in `write_dir`
    (a temporary sibling directory). apply_end durably marks success, and
    startup installs the completed stage after the live instance has closed. */
-struct Rdb_clone_apply_session {
+struct Rdb_clone_apply_session : Rdb_clone_tasks {
   std::string rocksdb_dir;   /* final destination */
   std::string write_dir;     /* where files are written during apply */
   bool is_provisioning;      /* true when data_dir was nullptr */
@@ -291,7 +310,7 @@ static uchar *alloc_locator(uint32_t session_id, uint &loc_len) {
 }
 
 static bool validate_locator(const uchar *loc, uint loc_len) {
-  if (loc == nullptr || loc_len < sizeof(Rdb_clone_locator)) return false;
+  if (loc == nullptr || loc_len != sizeof(Rdb_clone_locator)) return false;
   const auto *l = reinterpret_cast<const Rdb_clone_locator *>(loc);
   return l->magic == RDB_CLONE_LOCATOR_MAGIC &&
          l->version == RDB_CLONE_VERSION;
@@ -306,6 +325,7 @@ static uint32_t locator_session_id(const uchar *loc) {
 void rocksdb_clone_get_capability(Ha_clone_flagset &flags) {
   flags.reset();
   flags.set(HA_CLONE_BLOCKING);
+  flags.set(HA_CLONE_MULTI_TASK);
 }
 
 int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
@@ -319,6 +339,18 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
   if (mode == HA_CLONE_MODE_VERSION) {
     task_id = 0;
     loc = alloc_locator(0, loc_len);
+    return 0;
+  }
+
+  if (mode == HA_CLONE_MODE_ADD_TASK) {
+    if (!validate_locator(loc, loc_len)) return ER_CLONE_PROTOCOL;
+    std::lock_guard<std::mutex> guard(g_clone_mutex);
+    const auto it = g_clone_sessions.find(locator_session_id(loc));
+    if (it == g_clone_sessions.end()) return ER_CLONE_PROTOCOL;
+    auto &session = it->second;
+    task_id = session.next_task++;
+    session.active.insert(task_id);
+    loc = session.locator.get();
     return 0;
   }
 
@@ -358,6 +390,10 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
 
   Rdb_clone_session session;
   session.checkpoint_dir = checkpoint_dir;
+  uint locator_length = 0;
+  session.locator.reset(alloc_locator(session_id, locator_length));
+  /* Moving the session into the map keeps the locator address. */
+  const uchar *const locator = session.locator.get();
 
   MY_DIR *dir = my_dir(checkpoint_dir.c_str(), MYF(MY_WANT_STAT));
   if (dir == nullptr) {
@@ -386,12 +422,15 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB clone_begin: session %u, %zu files in checkpoint",
                   session_id, num_files);
-  loc = alloc_locator(session_id, loc_len);
+  /* Set the output locator only on success: the session owning it is
+  destroyed on any earlier return. */
+  loc = locator;
+  loc_len = locator_length;
   return 0;
 }
 
 int rocksdb_clone_copy(handlerton *hton, THD *, const uchar *loc,
-                       uint loc_len, uint, Ha_clone_cbk *cbk) {
+                       uint loc_len, uint task_id, Ha_clone_cbk *cbk) {
   if (!validate_locator(loc, loc_len)) return HA_EXIT_FAILURE;
 
   const uint32_t sid = locator_session_id(loc);
@@ -402,6 +441,9 @@ int rocksdb_clone_copy(handlerton *hton, THD *, const uchar *loc,
     std::lock_guard<std::mutex> guard(g_clone_mutex);
     const auto it = g_clone_sessions.find(sid);
     if (it == g_clone_sessions.end()) return HA_EXIT_FAILURE;
+    if (it->second.active.count(task_id) == 0) return ER_CLONE_PROTOCOL;
+    /* The master streams the checkpoint; workers participate in InnoDB. */
+    if (task_id != 0) return 0;
     checkpoint_dir = it->second.checkpoint_dir;
     files = it->second.files;
   }
@@ -465,24 +507,25 @@ int rocksdb_clone_ack(handlerton *, THD *, const uchar *, uint, uint, int,
 }
 
 int rocksdb_clone_end(handlerton *, THD *, const uchar *loc, uint loc_len,
-                      uint, int) {
+                      uint task_id, int in_err) {
+  if (!validate_locator(loc, loc_len)) return ER_CLONE_PROTOCOL;
+  const uint32_t sid = locator_session_id(loc);
+  if (sid == 0) {
+    delete[] loc;
+    return 0;
+  }
   std::string checkpoint_dir;
-
-  if (validate_locator(loc, loc_len)) {
-    const uint32_t sid = locator_session_id(loc);
+  {
     std::lock_guard<std::mutex> guard(g_clone_mutex);
     const auto it = g_clone_sessions.find(sid);
-    if (it != g_clone_sessions.end()) {
-      checkpoint_dir = it->second.checkpoint_dir;
-      g_clone_sessions.erase(it);
-    }
+    if (it == g_clone_sessions.end() ||
+        it->second.active.erase(task_id) != 1) return ER_CLONE_PROTOCOL;
+    if (in_err != 0) it->second.error = in_err;
+    if (!it->second.active.empty()) return 0;
+    checkpoint_dir = it->second.checkpoint_dir;
+    g_clone_sessions.erase(it);
   }
-
-  delete[] loc;
-
-  if (!checkpoint_dir.empty())
-    rocksdb::DestroyDB(checkpoint_dir, rocksdb::Options());
-
+  rocksdb::DestroyDB(checkpoint_dir, rocksdb::Options());
   return 0;
 }
 
@@ -501,6 +544,24 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
     task_id = 0;
     loc = alloc_locator(0, loc_len);
     return 0;
+  }
+
+  if (!validate_locator(loc, loc_len) || locator_session_id(loc) == 0)
+    return ER_CLONE_PROTOCOL;
+  const uint32_t session_id = locator_session_id(loc);
+  std::lock_guard<std::mutex> guard(g_clone_mutex);
+  if (mode == HA_CLONE_MODE_ADD_TASK) {
+    const auto it = g_apply_sessions.find(session_id);
+    if (it == g_apply_sessions.end()) return ER_CLONE_PROTOCOL;
+    task_id = it->second.next_task++;
+    it->second.active.insert(task_id);
+    /* Auxiliary apply must not replace a donor locator used by local copy. */
+    return 0;
+  }
+  if (g_apply_sessions.count(session_id) != 0 ||
+      (data_dir == nullptr && !g_apply_sessions.empty())) {
+    my_error(ER_CLONE_PROTOCOL, MYF(0), "RocksDB clone receive already active");
+    return ER_CLONE_PROTOCOL;
   }
 
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
@@ -547,16 +608,14 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
     }
   }
 
-  const uint32_t session_id = g_next_session_id.fetch_add(1);
-  {
-    std::lock_guard<std::mutex> guard(g_clone_mutex);
-    g_apply_sessions.emplace(
-        session_id,
-        Rdb_clone_apply_session{rocksdb_dir, write_dir, is_provisioning});
-  }
-
+  Rdb_clone_apply_session session;
+  session.rocksdb_dir = rocksdb_dir;
+  session.write_dir = write_dir;
+  session.is_provisioning = is_provisioning;
+  session.locator.reset(alloc_locator(session_id, loc_len));
+  loc = session.locator.get();
   task_id = 0;
-  loc = alloc_locator(session_id, loc_len);
+  g_apply_sessions.emplace(session_id, std::move(session));
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB clone_apply_begin: session %u, write_dir: %s",
                   session_id, write_dir.c_str());
@@ -632,24 +691,30 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
 }
 
 int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
-                            uint loc_len, uint, int in_err) {
+                            uint loc_len, uint task_id, int in_err) {
   std::string rocksdb_dir;
   std::string write_dir;
   bool is_provisioning = false;
 
   if (validate_locator(loc, loc_len)) {
     const uint32_t sid = locator_session_id(loc);
+    if (sid == 0) {
+      delete[] loc;
+      return 0;
+    }
     std::lock_guard<std::mutex> guard(g_clone_mutex);
     const auto it = g_apply_sessions.find(sid);
     if (it != g_apply_sessions.end()) {
+      if (it->second.active.erase(task_id) != 1) return ER_CLONE_PROTOCOL;
+      if (in_err != 0) it->second.error = in_err;
+      if (!it->second.active.empty()) return 0;
+      in_err = it->second.error;
       rocksdb_dir = it->second.rocksdb_dir;
       write_dir = it->second.write_dir;
       is_provisioning = it->second.is_provisioning;
       g_apply_sessions.erase(it);
     }
   }
-
-  delete[] loc;
 
   if (!is_provisioning || write_dir.empty() || rocksdb_dir.empty()) {
     return 0;

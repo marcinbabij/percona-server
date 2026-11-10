@@ -93,7 +93,10 @@ int Local::clone_exec() {
 
   auto &client_vector = m_clone_client.get_storage_vector();
   auto &client_tasks = m_clone_client.get_task_vector();
-  auto &server_vector = m_clone_server->get_storage_vector();
+  /* Each task begins on its own copy of the donor locators: engines write
+  the locators in begin, concurrently with other tasks. The master publishes
+  its begin result before spawning workers, which copy it here. */
+  auto server_vector = m_clone_server->get_storage_vector();
 
   Task_Vector server_tasks;
   server_tasks.reserve(MAX_CLONE_STORAGE_ENGINE);
@@ -130,6 +133,7 @@ int Local::clone_exec() {
 
   /* Spawn parallel threads for clone */
   if (is_master) {
+    m_clone_server->get_storage_vector() = server_vector;
     /* Copy Server locators to Client. */
     client_vector = server_vector;
 

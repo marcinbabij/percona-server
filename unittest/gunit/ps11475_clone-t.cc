@@ -46,13 +46,13 @@ TEST_F(CloneContract, NoPendingReceivePreservesLiveDatabase) {
 
 TEST_F(CloneContract, IncompleteReceiveMustNotReplaceLiveDatabase) {
   create_database(myrocks::test_datadir);
-  const uchar *locator = nullptr;
   uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
   ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
       length, task, HA_CLONE_MODE_START, nullptr));
   // Simulate the loss of session memory at restart without a successful end.
   myrocks::rdb_clone_destroy();
-  delete[] locator;
   EXPECT_EQ(myrocks::Rdb_clone_recovery::NONE,
             myrocks::rdb_clone_apply_pending(myrocks::test_datadir.c_str()));
   EXPECT_TRUE(fs::exists(myrocks::test_datadir + "/CURRENT"));
@@ -95,6 +95,47 @@ TEST_F(CloneContract, AmbiguousRecoveryPreservesEveryDatabase) {
   EXPECT_TRUE(fs::exists(live + "/CURRENT"));
   EXPECT_TRUE(fs::exists(live + "_clone_old/CURRENT"));
   EXPECT_TRUE(fs::exists(live + "_clone_recv/CURRENT"));
+}
+
+TEST_F(CloneContract, ApplyWorkersShareStageAndKeepItUntilLastEnd) {
+  uint length = 0, master_task = 0, worker_task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *master = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, master,
+      length, master_task, HA_CLONE_MODE_START, nullptr));
+  const auto stage = myrocks::test_datadir + "_clone_recv";
+  std::ofstream(stage + "/CURRENT") << "manifest";
+  const uchar *worker = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, worker,
+      length, worker_task, HA_CLONE_MODE_ADD_TASK, nullptr));
+  EXPECT_NE(master_task, worker_task);
+  EXPECT_EQ(donor.get(), worker);
+  EXPECT_TRUE(fs::exists(stage + "/CURRENT"));
+  EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, master,
+      length, master_task, ER_QUERY_INTERRUPTED));
+  EXPECT_FALSE(fs::exists(stage + "/CLONE_COMPLETE"));
+  EXPECT_TRUE(fs::exists(stage));
+  EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, worker,
+      length, worker_task, 0));
+  EXPECT_FALSE(fs::exists(stage + "/CLONE_COMPLETE"));
+  EXPECT_TRUE(myrocks::g_apply_sessions.empty());
+}
+
+TEST_F(CloneContract, ConcurrentStartCannotEraseActiveReceive) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *first = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, first,
+      length, task, HA_CLONE_MODE_START, nullptr));
+  const auto stage = myrocks::test_datadir + "_clone_recv";
+  std::ofstream(stage + "/CURRENT") << "manifest";
+  std::unique_ptr<uchar[]> other(myrocks::alloc_locator(124, length));
+  const uchar *second = other.get();
+  EXPECT_EQ(ER_CLONE_PROTOCOL, myrocks::rocksdb_clone_apply_begin(nullptr,
+      nullptr, second, length, task, HA_CLONE_MODE_START, nullptr));
+  EXPECT_TRUE(fs::exists(stage + "/CURRENT"));
+  EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, first,
+      length, 0, ER_QUERY_INTERRUPTED));
 }
 
 int main(int argc, char **argv) {
