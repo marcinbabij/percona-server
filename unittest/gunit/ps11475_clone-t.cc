@@ -387,6 +387,47 @@ TEST_F(CloneContract, DonorChunksFilesLargerThanFourGiB) {
                                         0, 0));
 }
 
+TEST_F(CloneContract, LocalReceiveWaitsForRootAndRetainsRelativeLayout) {
+  const auto clone_root = root + "/local";
+  myrocks::test_datadir = "./nested/.rocksdb";
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_START, clone_root.c_str()));
+  EXPECT_FALSE(fs::exists(clone_root));
+  // InnoDB creates the root during its apply_begin callback.
+  fs::create_directory(clone_root);
+  myrocks::Rdb_clone_data_desc descriptor{};
+  descriptor.version = myrocks::RDB_CLONE_DESC_VERSION;
+  descriptor.file_size = 8;
+  descriptor.data_size = 8;
+  descriptor.file_count = 1;
+  strcpy(descriptor.rel_path, "000001.sst");
+  ApplyCallback callback;
+  callback.set_data_desc(reinterpret_cast<const uchar *>(&descriptor),
+                         sizeof(descriptor));
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply(nullptr, nullptr, locator,
+      length, task, 0, &callback));
+  EXPECT_EQ(8U, fs::file_size(clone_root + "/nested/.rocksdb/000001.sst"));
+  EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator,
+      length, task, 0));
+}
+
+TEST_F(CloneContract, LocalReceiveRejectsPathsOutsideCloneRoot) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const auto clone_root = root + "/local";
+  for (const auto &path : {root + "/absolute", std::string("../outside"),
+                          std::string("./"), std::string("nested/../outside")}) {
+    myrocks::test_datadir = path;
+    const uchar *locator = donor.get();
+    EXPECT_EQ(ER_NOT_SUPPORTED_YET, myrocks::rocksdb_clone_apply_begin(nullptr,
+        nullptr, locator, length, task, HA_CLONE_MODE_START, clone_root.c_str()));
+  }
+  EXPECT_FALSE(fs::exists(clone_root));
+}
+
 int main(int argc, char **argv) {
   MY_INIT(argv[0]);
   ::testing::InitGoogleTest(&argc, argv);

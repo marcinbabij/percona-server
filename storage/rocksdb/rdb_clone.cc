@@ -117,6 +117,11 @@ struct Rdb_clone_apply_session : Rdb_clone_tasks {
   std::string rocksdb_dir;   /* final destination */
   std::string write_dir;     /* where files are written during apply */
   bool is_provisioning;      /* true when data_dir was nullptr */
+  /** DATA DIRECTORY of a local or remote non-provisioning clone, created by
+  InnoDB; empty for provisioning */
+  std::string local_root;
+  /** Whether write_dir and its parents below local_root exist */
+  bool directory_ready{false};
   /** Number of files announced by the donor, zero before the first chunk */
   uint32_t file_count{0};
   /** file_index expected in the next chunk */
@@ -633,7 +638,27 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
   /* Resolve the final destination directory. */
   std::string rocksdb_dir;
   if (!is_provisioning) {
-    rocksdb_dir = std::string(data_dir) + "/rocksdb";
+    std::string relative(rdb_get_rocksdb_datadir());
+    while (relative.rfind("./", 0) == 0) relative.erase(0, 2);
+    while (!relative.empty() && relative.back() == '/') relative.pop_back();
+    /* An absolute source path cannot be reused inside an isolated clone. */
+    if (relative.empty() || relative.front() == '/') {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+               "RocksDB DATA DIRECTORY clone with an absolute engine path");
+      return ER_NOT_SUPPORTED_YET;
+    }
+    for (size_t begin = 0; begin < relative.size();) {
+      const auto slash = relative.find('/', begin);
+      const auto part = relative.substr(begin, slash - begin);
+      if (part.empty() || part == "." || part == "..") {
+        my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                 "RocksDB DATA DIRECTORY clone with a non-contained path");
+        return ER_NOT_SUPPORTED_YET;
+      }
+      if (slash == std::string::npos) break;
+      begin = slash + 1;
+    }
+    rocksdb_dir = std::string(data_dir) + "/" + relative;
   } else {
     const char *live_dir = rdb_get_rocksdb_datadir();
     if (live_dir == nullptr) {
@@ -657,22 +682,18 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
     remove_clone_stage(write_dir);
   }
 
-  if (my_mkdir(write_dir.c_str(), 0750, MYF(0)) != 0 && errno != EEXIST) {
+  if (is_provisioning &&
+      my_mkdir(write_dir.c_str(), 0750, MYF(0)) != 0 && errno != EEXIST) {
     my_error(ER_CANT_CREATE_FILE, MYF(0), write_dir.c_str(), errno);
     return HA_EXIT_FAILURE;
-  }
-
-  if (!is_provisioning) {
-    if (my_mkdir(rocksdb_dir.c_str(), 0750, MYF(0)) != 0 && errno != EEXIST) {
-      my_error(ER_CANT_CREATE_FILE, MYF(0), rocksdb_dir.c_str(), errno);
-      return HA_EXIT_FAILURE;
-    }
   }
 
   Rdb_clone_apply_session session;
   session.rocksdb_dir = rocksdb_dir;
   session.write_dir = write_dir;
   session.is_provisioning = is_provisioning;
+  if (!is_provisioning) session.local_root = data_dir;
+  session.directory_ready = is_provisioning;
   session.locator.reset(alloc_locator(session_id, loc_len));
   loc = session.locator.get();
   task_id = 0;
@@ -740,6 +761,22 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
     } else if (session.current_file != desc->rel_path ||
                session.file_size != desc->file_size) {
       return clone_protocol_error();
+    }
+    if (!session.directory_ready) {
+      /* InnoDB owns creation of the clone root in apply_begin. Defer our
+      subdirectories until all engines have completed that phase. */
+      for (size_t begin = session.local_root.size() + 1;
+           begin <= session.write_dir.size();) {
+        const auto slash = session.write_dir.find('/', begin);
+        const auto path = session.write_dir.substr(0, slash);
+        if (my_mkdir(path.c_str(), 0750, MYF(0)) != 0 && errno != EEXIST) {
+          my_error(ER_CANT_CREATE_FILE, MYF(0), path.c_str(), errno);
+          return HA_EXIT_FAILURE;
+        }
+        if (slash == std::string::npos) break;
+        begin = slash + 1;
+      }
+      session.directory_ready = true;
     }
     write_dir = session.write_dir;
   }
@@ -821,6 +858,10 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
   }
 
   if (!is_provisioning || write_dir.empty() || rocksdb_dir.empty()) {
+    if (in_err == 0 && !write_dir.empty() &&
+        (!sync_clone_directory(write_dir) ||
+         !sync_clone_directory(clone_parent_dir(write_dir))))
+      return clone_io_error();
     return input_error == 0 ? in_err : 0;
   }
 

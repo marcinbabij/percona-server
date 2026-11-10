@@ -1,0 +1,20 @@
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 2;
+CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO clone_i VALUES (1);
+INSERT INTO clone_r VALUES (1);
+CLONE LOCAL DATA DIRECTORY = 'CLONE_DIR';
+# restart: --datadir=CLONE_DIR
+USE test;
+SELECT * FROM clone_i;
+id
+1
+SELECT * FROM clone_r;
+id
+1
+include/assert.inc [Both storage engines must retain their rows after clone recovery]
+# restart:
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;

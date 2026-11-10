@@ -1,0 +1,2 @@
+[mysqld.1]
+rocksdb-datadir=./custom_rocksdb
