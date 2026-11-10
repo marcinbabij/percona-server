@@ -165,7 +165,7 @@ IF ((NOT (DEFINED WITHOUT_GROUP_REPLICATION AND WITHOUT_GROUP_REPLICATION)) AND
   ADD_DEFINITIONS(-DLOG_COMPONENT_TAG="group_replication")
 
   IF(GROUP_REPLICATION_WITH_ROCKSDB)
-    ADD_COMPILE_DEFINITIONS(src/observer_trans.cc src/asynchronous_channels_state_observer.cc
+    MY_ADD_COMPILE_DEFINITIONS(src/observer_trans.cc src/asynchronous_channels_state_observer.cc
       COMPILE_DEFINITIONS "GROUP_REPLICATION_WITH_ROCKSDB")
     MESSAGE(STATUS "GROUP_REPLICATION_WITH_ROCKSDB is turned on")
   ELSE()

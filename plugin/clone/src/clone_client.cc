@@ -1746,6 +1746,12 @@ int Client::set_descriptor(const uchar *buffer, size_t length) {
 
   clone_callback->set_data_desc(buffer, length);
   clone_callback->clear_flags();
+  /* Must match donor's loc_index so ACKs sent via buffer_cbk reach the
+     correct SE on the donor (e.g. InnoDB's wait_ack, not a no-op clone_ack).
+     Without this, get_loc_index() always returns 0 and the ACK is routed to
+     the SE at index 0 (RocksDB when MyRocks is loaded), leaving InnoDB's
+     wait_ack blocked forever. */
+  clone_callback->set_loc_index(loc_index);
 
   /* Apply using descriptor */
   assert(loc_index < m_tasks.size());

@@ -87,6 +87,7 @@
 /* MyRocks includes */
 #include "./event_listener.h"
 #include "./ha_rocksdb_proto.h"
+#include "./rdb_clone.h"
 #include "./ha_rockspart.h"
 #include "./logger.h"
 #include "./rdb_cf_manager.h"
@@ -6538,6 +6539,16 @@ static int rocksdb_init_internal(void *const p) {
 
   rocksdb_hton->partition_flags = rocksdb_partition_flags;
 
+  rocksdb_hton->clone_interface.clone_capability =
+      rocksdb_clone_get_capability;
+  rocksdb_hton->clone_interface.clone_begin = rocksdb_clone_begin;
+  rocksdb_hton->clone_interface.clone_copy = rocksdb_clone_copy;
+  rocksdb_hton->clone_interface.clone_ack = rocksdb_clone_ack;
+  rocksdb_hton->clone_interface.clone_end = rocksdb_clone_end;
+  rocksdb_hton->clone_interface.clone_apply_begin = rocksdb_clone_apply_begin;
+  rocksdb_hton->clone_interface.clone_apply = rocksdb_clone_apply;
+  rocksdb_hton->clone_interface.clone_apply_end = rocksdb_clone_apply_end;
+
   if (rocksdb_db_options->max_open_files > (long)open_files_limit) {
     LogPluginErrMsg(INFORMATION_LEVEL, 0,
                     "rocksdb_max_open_files should not be greater than the "
@@ -6901,6 +6912,11 @@ static int rocksdb_init_internal(void *const p) {
     DBUG_RETURN(HA_EXIT_FAILURE);
   }
 
+  /* If a provisioning clone completed, its staged data is still in
+     <rocksdb_datadir>_clone_recv.  Swap it in now, while the old RocksDB
+     instance is fully closed and before we open the new one. */
+  rdb_clone_apply_pending(rocksdb_datadir);
+
   LogPluginErrMsg(INFORMATION_LEVEL, 0, "Opening TransactionDB...");
 
   status = rocksdb::TransactionDB::Open(
@@ -7091,6 +7107,8 @@ static int rocksdb_init_internal(void *const p) {
   DBUG_EXECUTE_IF("rocksdb_init_failure_everything_initialized",
                   { DBUG_RETURN(HA_EXIT_FAILURE); });
 
+  rdb_clone_init();
+
   DBUG_RETURN(HA_EXIT_SUCCESS);
 }
 
@@ -7190,6 +7208,8 @@ static int rocksdb_shutdown(bool minimalShutdown) {
   // The only code executed during both normal and init faiure shutdown are
   // deleting mutexes. The plan is to gradually increase this section so there's
   // one single shutdown function for all scenarios.
+
+  rdb_clone_destroy();
 
   rdb_block_cache_resize_mutex.destroy();
   rdb_bottom_pri_background_compactions_resize_mutex.destroy();
@@ -16387,6 +16407,8 @@ bool ha_rocksdb::can_use_bloom_filter(THD *thd, const Rdb_key_def &kd,
 
 /* For modules that need access to the global data structures */
 rocksdb::TransactionDB *rdb_get_rocksdb_db() { return rdb; }
+
+const char *rdb_get_rocksdb_datadir() { return rocksdb_datadir; }
 
 Rdb_cf_manager &rdb_get_cf_manager() { return cf_manager; }
 

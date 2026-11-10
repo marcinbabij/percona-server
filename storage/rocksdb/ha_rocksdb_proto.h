@@ -72,6 +72,7 @@ extern const std::string TRUNCATE_TABLE_PREFIX;
 */
 
 rocksdb::TransactionDB *rdb_get_rocksdb_db();
+const char *rdb_get_rocksdb_datadir();
 
 class Rdb_cf_manager;
 Rdb_cf_manager &rdb_get_cf_manager();
