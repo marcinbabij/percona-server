@@ -39,7 +39,8 @@ class CloneContract : public ::testing::Test {
 
 TEST_F(CloneContract, NoPendingReceivePreservesLiveDatabase) {
   create_database(myrocks::test_datadir);
-  EXPECT_FALSE(myrocks::rdb_clone_apply_pending(myrocks::test_datadir.c_str()));
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::NONE,
+            myrocks::rdb_clone_apply_pending(myrocks::test_datadir.c_str()));
   EXPECT_TRUE(fs::exists(myrocks::test_datadir + "/CURRENT"));
 }
 
@@ -52,8 +53,48 @@ TEST_F(CloneContract, IncompleteReceiveMustNotReplaceLiveDatabase) {
   // Simulate the loss of session memory at restart without a successful end.
   myrocks::rdb_clone_destroy();
   delete[] locator;
-  EXPECT_FALSE(myrocks::rdb_clone_apply_pending(myrocks::test_datadir.c_str()));
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::NONE,
+            myrocks::rdb_clone_apply_pending(myrocks::test_datadir.c_str()));
   EXPECT_TRUE(fs::exists(myrocks::test_datadir + "/CURRENT"));
+}
+
+TEST_F(CloneContract, RestartBetweenRenamesMustPreserveOldDatabase) {
+  const auto live = myrocks::test_datadir;
+  create_database(live);
+  create_database(live + "_clone_recv");
+  std::ofstream(live + "_clone_recv/CLONE_COMPLETE").close();
+  // This is the on-disk state after the first rename and before the second.
+  fs::rename(live, live + "_clone_old");
+  const auto installed = myrocks::rdb_clone_apply_pending(live.c_str());
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::INSTALLED, installed);
+  EXPECT_TRUE(fs::exists(live + "/CURRENT"));
+  EXPECT_TRUE(fs::exists(live + "_clone_old/CURRENT"));
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::INSTALLED,
+            myrocks::rdb_clone_apply_pending(live.c_str()));
+  EXPECT_EQ(0, myrocks::rdb_clone_finish_pending(live.c_str()));
+  EXPECT_FALSE(fs::exists(live + "_clone_old"));
+  EXPECT_TRUE(fs::exists(live + "/CURRENT"));
+}
+
+TEST_F(CloneContract, MissingStageRestoresSavedDatabase) {
+  const auto live = myrocks::test_datadir;
+  create_database(live + "_clone_old");
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::NONE,
+            myrocks::rdb_clone_apply_pending(live.c_str()));
+  EXPECT_TRUE(fs::exists(live + "/CURRENT"));
+}
+
+TEST_F(CloneContract, AmbiguousRecoveryPreservesEveryDatabase) {
+  const auto live = myrocks::test_datadir;
+  create_database(live);
+  create_database(live + "_clone_old");
+  create_database(live + "_clone_recv");
+  std::ofstream(live + "_clone_recv/CLONE_COMPLETE").close();
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::ERROR,
+            myrocks::rdb_clone_apply_pending(live.c_str()));
+  EXPECT_TRUE(fs::exists(live + "/CURRENT"));
+  EXPECT_TRUE(fs::exists(live + "_clone_old/CURRENT"));
+  EXPECT_TRUE(fs::exists(live + "_clone_recv/CURRENT"));
 }
 
 int main(int argc, char **argv) {

@@ -151,56 +151,131 @@ void rdb_clone_destroy() {
   g_apply_sessions.clear();
 }
 
-bool rdb_clone_apply_pending(const char *rocksdb_dir) {
-  if (rocksdb_dir == nullptr) return false;
+/** Check if a path names an existing directory.
+@param[in]  path  path to check
+@return true if path is a directory */
+static bool clone_directory_exists(const std::string &path) {
+  MY_STAT st;
+  return my_stat(path.c_str(), &st, MYF(0)) != nullptr && S_ISDIR(st.st_mode);
+}
 
+/** Rename a clone directory and persist the rename.
+Errors are logged here: during plugin initialization there is no session to
+receive the error raised by my_rename().
+@param[in]  from  existing directory
+@param[in]  to    new name
+@return true on success */
+static bool clone_rename_directory(const std::string &from,
+                                   const std::string &to) {
+  if (my_rename(from.c_str(), to.c_str(), MYF(MY_WME)) != 0 ||
+      !sync_clone_directory(clone_parent_dir(to))) {
+    LogPluginErrMsg(ERROR_LEVEL, 0, "RocksDB clone: cannot rename %s to %s: %d",
+                    from.c_str(), to.c_str(), errno);
+    return false;
+  }
+  return true;
+}
+
+/* Installation is a sequence of two durable renames, each of them atomic:
+     live -> live_clone_old (skipped if there is no live directory),
+     live_clone_recv -> live.
+   The completion marker travels with the received directory and is removed
+   only after the old database is destroyed, so every crash point leaves one
+   of these states (S = stage, B = backup, L = live, C = has marker):
+     S(C)  L  : not started            -> both renames
+     S(C)     : no previous database   -> second rename
+     S(C)  B  : first rename done      -> second rename
+     B  L(C)  : both renames done      -> INSTALLED, finish removes B
+     L(C)     : B destroyed            -> NONE, finish removes marker
+     S        : receive not completed  -> stage discarded
+   Any other combination with B present cannot be explained by this sequence
+   and is rejected, except a lone B, which is restored. */
+Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
+  if (rocksdb_dir == nullptr) return Rdb_clone_recovery::NONE;
   const std::string live_dir(rocksdb_dir);
   const std::string staging_dir = live_dir + "_clone_recv";
-
-  MY_STAT st;
-  if (my_stat(staging_dir.c_str(), &st, MYF(0)) == nullptr ||
-      !S_ISDIR(st.st_mode))
-    return false;  /* no pending clone */
-
-  /* A receive directory exists before any files arrive. Only a durable
-  successful end authorizes replacing the live database on restart. */
-  if (!clone_is_complete(staging_dir)) {
-    remove_clone_stage(staging_dir);
-    return false;
-  }
-
   const std::string backup_dir = live_dir + "_clone_old";
+  const bool have_live = clone_directory_exists(live_dir);
+  const bool have_backup = clone_directory_exists(backup_dir);
+
+  if (!clone_directory_exists(staging_dir)) {
+    if (!have_backup) return Rdb_clone_recovery::NONE;
+    /* Installation finished, but engine recovery or backup cleanup did not. */
+    if (clone_is_complete(live_dir)) return Rdb_clone_recovery::INSTALLED;
+    if (!have_live) {
+      LogPluginErrMsg(WARNING_LEVEL, 0,
+                      "RocksDB clone: restoring %s from %s",
+                      live_dir.c_str(), backup_dir.c_str());
+      if (!clone_rename_directory(backup_dir, live_dir))
+        return Rdb_clone_recovery::ERROR;
+      return Rdb_clone_recovery::NONE;
+    }
+    LogPluginErrMsg(ERROR_LEVEL, 0,
+                    "RocksDB clone: both %s and %s exist without a completed "
+                    "clone; remove the one which is not needed",
+                    live_dir.c_str(), backup_dir.c_str());
+    return Rdb_clone_recovery::ERROR;
+  }
+
+  if (!clone_is_complete(staging_dir)) {
+    /* An unfinished receive cannot authorize any change to a saved DB. */
+    if (have_backup) {
+      LogPluginErrMsg(ERROR_LEVEL, 0,
+                      "RocksDB clone: incomplete %s found next to saved %s",
+                      staging_dir.c_str(), backup_dir.c_str());
+      return Rdb_clone_recovery::ERROR;
+    }
+    LogPluginErrMsg(INFORMATION_LEVEL, 0,
+                    "RocksDB clone: discarding incomplete %s",
+                    staging_dir.c_str());
+    remove_clone_stage(staging_dir);
+    return Rdb_clone_recovery::NONE;
+  }
 
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB init: pending clone found, swapping %s -> %s",
+                  "RocksDB clone: installing %s into %s",
                   staging_dir.c_str(), live_dir.c_str());
-
-  rocksdb::DestroyDB(backup_dir, rocksdb::Options());
-
-  if (my_rename(live_dir.c_str(), backup_dir.c_str(), MYF(MY_WME)) != 0) {
-    LogPluginErrMsg(ERROR_LEVEL, 0,
-                    "RocksDB init: rename %s -> %s failed: %d",
-                    live_dir.c_str(), backup_dir.c_str(), errno);
-    return false;
+  if (have_backup) {
+    /* After the first rename, the backup is the only old copy. Never
+    destroy it or replace an unexpected live directory on a retry. */
+    if (have_live) {
+      LogPluginErrMsg(ERROR_LEVEL, 0,
+                      "RocksDB clone: %s, %s and completed %s all exist",
+                      live_dir.c_str(), backup_dir.c_str(),
+                      staging_dir.c_str());
+      return Rdb_clone_recovery::ERROR;
+    }
+  } else if (have_live && !clone_rename_directory(live_dir, backup_dir)) {
+    return Rdb_clone_recovery::ERROR;
   }
 
-  if (my_rename(staging_dir.c_str(), live_dir.c_str(), MYF(MY_WME)) != 0) {
-    LogPluginErrMsg(ERROR_LEVEL, 0,
-                    "RocksDB init: rename %s -> %s failed: %d, "
-                    "restoring backup",
-                    staging_dir.c_str(), live_dir.c_str(), errno);
-    my_rename(backup_dir.c_str(), live_dir.c_str(), MYF(0));
-    return false;
+  if (!clone_rename_directory(staging_dir, live_dir))
+    return Rdb_clone_recovery::ERROR;
+  return Rdb_clone_recovery::INSTALLED;
+}
+
+int rdb_clone_finish_pending(const char *rocksdb_dir) {
+  const std::string live_dir(rocksdb_dir);
+  if (!clone_is_complete(live_dir)) return 0;
+  const std::string backup_dir = live_dir + "_clone_old";
+  if (clone_directory_exists(backup_dir)) {
+    const auto status = rocksdb::DestroyDB(backup_dir, rocksdb::Options());
+    if (!status.ok() || !sync_clone_directory(clone_parent_dir(live_dir))) {
+      LogPluginErrMsg(ERROR_LEVEL, 0, "RocksDB clone: cannot remove %s: %s",
+                      backup_dir.c_str(), status.ToString().c_str());
+      return clone_io_error();
+    }
   }
-
-  rocksdb::DestroyDB(backup_dir, rocksdb::Options());
-
-  my_delete((live_dir + RDB_CLONE_COMPLETE).c_str(), MYF(MY_WME));
-  sync_clone_directory(live_dir);
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB init: pending clone installed at %s",
+  if (my_delete((live_dir + RDB_CLONE_COMPLETE).c_str(), MYF(MY_WME)) != 0 ||
+      !sync_clone_directory(live_dir)) {
+    LogPluginErrMsg(ERROR_LEVEL, 0,
+                    "RocksDB clone: cannot remove completion marker in %s: %d",
+                    live_dir.c_str(), errno);
+    return clone_io_error();
+  }
+  LogPluginErrMsg(INFORMATION_LEVEL, 0, "RocksDB clone: installed %s",
                   live_dir.c_str());
-  return true;
+  return 0;
 }
 
 /* ---- Internal helpers ---- */

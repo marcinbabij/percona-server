@@ -7084,6 +7084,11 @@ static int rocksdb_init_internal(void *const p) {
   // has been successfully initialized.
   commit_latency_stats = new rocksdb::HistogramImpl();
 
+  // Keep the old clone database until the received engine initialized.
+  if (rdb_clone_finish_pending(rocksdb_datadir) != 0) {
+    DBUG_RETURN(HA_EXIT_FAILURE);
+  }
+
   // succeeded, set the init status flag
   rdb_get_hton_init_state()->set_initialized(true);
 

@@ -23,12 +23,30 @@ namespace myrocks {
 /* Initialize the clone module. Call once from rocksdb_init_internal(). */
 void rdb_clone_init();
 
-/* If a provisioning clone left a pending staged directory
-   (<rocksdb_dir>_clone_recv), atomically swap it into place.
-   Must be called BEFORE TransactionDB::Open so the old instance is fully
-   shut down and cannot write into the directory mid-swap.
-   Returns true if a swap was performed, false if nothing was pending. */
-bool rdb_clone_apply_pending(const char *rocksdb_dir);
+/** Outcome of the startup check for a pending provisioning clone. */
+enum class Rdb_clone_recovery {
+  /** rocksdb_dir holds the database to open: no clone was pending, an
+  incomplete receive was discarded, or the saved database was restored. */
+  NONE,
+  /** rocksdb_dir holds a received database and <rocksdb_dir>_clone_old may
+  hold the previous one until rdb_clone_finish_pending() removes it. */
+  INSTALLED,
+  /** The directories are in a state which cannot be resolved without
+  risking the only copy of a database. Startup must stop. */
+  ERROR
+};
+
+/** Resume a completed provisioning clone, preserving the old database.
+Call before discovering or opening any files in rocksdb_dir. ERROR means
+startup must stop; NONE also covers discarding an incomplete receive.
+@param[in]  rocksdb_dir  configured rocksdb_datadir
+@return recovery outcome, see Rdb_clone_recovery */
+Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir);
+
+/** Remove the saved database only after the received engine initialized.
+@param[in]  rocksdb_dir  configured rocksdb_datadir
+@return zero on success, or a MySQL error code on persistence failure */
+int rdb_clone_finish_pending(const char *rocksdb_dir);
 
 /* Destroy the clone module. Call once from rocksdb_shutdown(). */
 void rdb_clone_destroy();
