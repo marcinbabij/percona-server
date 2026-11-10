@@ -3,7 +3,7 @@
 
 Usage: python3 ps11475_run_contract_tests.py /mnt/nvme1/bin/PS-11475
 The production implementation is compiled without test-specific edits. Logging is
-disabled, and the fixture supplies the two MyRocks engine accessors. These
+captured by the fixture, which supplies the two MyRocks engine accessors. These
 tests cover clone descriptor and recovery contracts independently of mysqld.
 """
 from pathlib import Path

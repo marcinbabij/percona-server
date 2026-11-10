@@ -6,6 +6,22 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <fstream>
+#include <cstdarg>
+#include <vector>
+#include "mysql/components/services/log_builtins.h"
+
+static std::vector<std::string> clone_messages;
+static void capture_clone_log(const char *format, ...) {
+  char buffer[4096];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  clone_messages.emplace_back(buffer);
+}
+#undef LogPluginErrMsg
+#define LogPluginErrMsg(severity, code, ...) capture_clone_log(__VA_ARGS__)
+
 #include "storage/rocksdb/rdb_clone.cc"
 
 namespace fs = std::filesystem;
@@ -19,6 +35,7 @@ class CloneContract : public ::testing::Test {
  protected:
   std::string root;
   void SetUp() override {
+    clone_messages.clear();
     char pattern[] = "/tmp/ps11475-contract-XXXXXX";
     root = mkdtemp(pattern);
     myrocks::test_datadir = root + "/live";
@@ -426,6 +443,39 @@ TEST_F(CloneContract, LocalReceiveRejectsPathsOutsideCloneRoot) {
         nullptr, locator, length, task, HA_CLONE_MODE_START, clone_root.c_str()));
   }
   EXPECT_FALSE(fs::exists(clone_root));
+}
+
+TEST_F(CloneContract, ApplyOwnsDescriptorAcrossCallbackBufferReuse) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_START, nullptr));
+  myrocks::Rdb_clone_data_desc descriptor{};
+  descriptor.version = myrocks::RDB_CLONE_DESC_VERSION;
+  descriptor.file_size = 8;
+  descriptor.data_size = 8;
+  descriptor.file_count = 1;
+  strcpy(descriptor.rel_path, "000001.sst");
+  class ReuseCallback : public ApplyCallback {
+   public:
+    myrocks::Rdb_clone_data_desc *descriptor;
+    int apply_file_cbk(Ha_clone_file file) override {
+      const int error = ApplyCallback::apply_file_cbk(file);
+      // Network receive reuses the packet that held the descriptor.
+      strcpy(descriptor->rel_path, "overwritten");
+      return error;
+    }
+  } callback;
+  callback.descriptor = &descriptor;
+  callback.set_data_desc(reinterpret_cast<const uchar *>(&descriptor),
+                         sizeof(descriptor));
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply(nullptr, nullptr, locator,
+      length, task, 0, &callback));
+  EXPECT_EQ("RocksDB clone_apply: apply_file_cbk for '000001.sst' returned 0",
+            clone_messages.back());
+  EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator,
+      length, task, 0));
 }
 
 int main(int argc, char **argv) {

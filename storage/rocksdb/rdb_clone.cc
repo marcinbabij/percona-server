@@ -713,7 +713,11 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
   const uchar *desc_buf = cbk->get_data_desc(&desc_len);
   if (desc_buf == nullptr || desc_len != sizeof(Rdb_clone_data_desc))
     return clone_protocol_error();
-  const auto *desc = reinterpret_cast<const Rdb_clone_data_desc *>(desc_buf);
+  /* The callback receives another network packet and can replace or free
+  the buffer backing get_data_desc(). Own every field used across it. */
+  Rdb_clone_data_desc owned_desc;
+  memcpy(&owned_desc, desc_buf, sizeof(owned_desc));
+  const auto *desc = &owned_desc;
   if (desc->version != RDB_CLONE_DESC_VERSION ||
       !valid_clone_filename(desc->rel_path, sizeof(desc->rel_path)))
     return clone_protocol_error();
