@@ -3,7 +3,14 @@
 --let $port = `SELECT @@port`
 --replace_result $CLONE_PLUGIN CLONE_PLUGIN
 --eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN'
-CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+if ($custom_column_family)
+{
+  CREATE TABLE clone_r (id INT, PRIMARY KEY(id) COMMENT 'cfname=donor_only') ENGINE=RocksDB;
+}
+if (!$custom_column_family)
+{
+  CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+}
 CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
 INSERT INTO clone_r VALUES (7);
 INSERT INTO clone_i VALUES (7);

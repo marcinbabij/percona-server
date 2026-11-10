@@ -1,0 +1,3 @@
+# The donor has a column family absent from the old recipient database.
+--let $custom_column_family = 1
+--source ../include/ps11475_provision.inc

@@ -6383,6 +6383,14 @@ static int rocksdb_init_internal(void *const p) {
   }
 #endif
 
+  /* Install before any logger, column-family discovery or options check
+  touches the database. All initialization must describe the same files. */
+  if (rdb_clone_apply_pending(rocksdb_datadir) == Rdb_clone_recovery::ERROR) {
+    LogPluginErrMsg(ERROR_LEVEL, 0,
+                    "RocksDB clone recovery could not safely install files");
+    DBUG_RETURN(HA_EXIT_FAILURE);
+  }
+
   if (THDVAR(nullptr, write_disable_wal) &&
       rocksdb_flush_log_at_trx_commit == FLUSH_LOG_SYNC) {
     LogPluginErrMsg(ERROR_LEVEL, 0,
@@ -6911,11 +6919,6 @@ static int rocksdb_init_internal(void *const p) {
         status, "Compatibility check against existing database options failed");
     DBUG_RETURN(HA_EXIT_FAILURE);
   }
-
-  /* If a provisioning clone completed, its staged data is still in
-     <rocksdb_datadir>_clone_recv.  Swap it in now, while the old RocksDB
-     instance is fully closed and before we open the new one. */
-  rdb_clone_apply_pending(rocksdb_datadir);
 
   LogPluginErrMsg(INFORMATION_LEVEL, 0, "Opening TransactionDB...");
 
