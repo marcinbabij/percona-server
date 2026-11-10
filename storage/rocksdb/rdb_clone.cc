@@ -17,6 +17,7 @@
 
 /* C++ standard headers */
 #include <atomic>
+#include <algorithm>
 #include <mutex>
 #include <memory>
 #include <unordered_set>
@@ -318,6 +319,32 @@ static bool validate_locator(const uchar *loc, uint loc_len) {
 
 static uint32_t locator_session_id(const uchar *loc) {
   return reinterpret_cast<const Rdb_clone_locator *>(loc)->session_id;
+}
+
+static int clone_protocol_error() {
+  my_error(ER_CLONE_PROTOCOL, MYF(0), "Invalid RocksDB clone descriptor");
+  return ER_CLONE_PROTOCOL;
+}
+
+/* Only flat checkpoint files may be supplied by the donor. In particular,
+completion markers and paths outside the stage are never wire filenames. */
+static bool valid_clone_filename(const char *name, size_t capacity) {
+  const char *end = static_cast<const char *>(memchr(name, '\0', capacity));
+  if (end == nullptr || end == name) return false;
+  const std::string file(name, end);
+  if (file == "CURRENT" || file == "IDENTITY") return true;
+  size_t first = 0, last = file.size();
+  if (file.rfind("MANIFEST-", 0) == 0) first = 9;
+  else if (file.rfind("OPTIONS-", 0) == 0) first = 8;
+  else {
+    const auto dot = file.find('.');
+    if (dot == std::string::npos) return false;
+    const auto suffix = file.substr(dot);
+    if (suffix != ".sst" && suffix != ".log" && suffix != ".blob") return false;
+    last = dot;
+  }
+  return first < last && std::all_of(file.begin() + first, file.begin() + last,
+                                   [](char c) { return c >= '0' && c <= '9'; });
 }
 
 /* ---- Donor (source) side ---- */
@@ -629,22 +656,13 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
 
   uint desc_len = 0;
   const uchar *desc_buf = cbk->get_data_desc(&desc_len);
-  if (desc_buf == nullptr || desc_len < sizeof(Rdb_clone_data_desc)) {
-    LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                    "RocksDB clone_apply: no/short descriptor (len=%u), "
-                    "skipping", desc_len);
-    return 0;
-  }
-
-  const auto *desc =
-      reinterpret_cast<const Rdb_clone_data_desc *>(desc_buf);
-
-  /* State-change sentinel: empty rel_path with zero file_size. */
-  if (desc->file_size == 0 && desc->rel_path[0] == '\0') {
-    LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                    "RocksDB clone_apply: sentinel descriptor, skipping");
-    return 0;
-  }
+  if (desc_buf == nullptr || desc_len != sizeof(Rdb_clone_data_desc))
+    return clone_protocol_error();
+  const auto *desc = reinterpret_cast<const Rdb_clone_data_desc *>(desc_buf);
+  if (desc->version != RDB_CLONE_DESC_VERSION ||
+      !valid_clone_filename(desc->rel_path, sizeof(desc->rel_path)))
+    return clone_protocol_error();
+  const uint64_t expected_size = desc->file_size;
 
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB clone_apply: file '%s' size=%llu",
@@ -669,7 +687,7 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
   cbk->set_dest_name(dest_path.c_str());
 
   const File dest_fd =
-      my_open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, MYF(MY_WME));
+      my_open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, MYF(MY_WME));
   if (dest_fd < 0) return HA_EXIT_FAILURE;
 
   Ha_clone_file dest_file{};
@@ -680,6 +698,9 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
                   "RocksDB clone_apply: calling apply_file_cbk for '%s'",
                   desc->rel_path);
   int err = cbk->apply_file_cbk(dest_file);
+  if (err == 0 && my_seek(dest_fd, 0, MY_SEEK_CUR, MYF(MY_WME)) !=
+                      expected_size)
+    err = clone_protocol_error();
   if (err == 0 && my_sync(dest_fd, MYF(MY_WME)) != 0)
     err = clone_io_error();
   if (my_close(dest_fd, MYF(MY_WME)) != 0 && err == 0)

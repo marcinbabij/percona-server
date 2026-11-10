@@ -138,6 +138,148 @@ TEST_F(CloneContract, ConcurrentStartCannotEraseActiveReceive) {
       length, 0, ER_QUERY_INTERRUPTED));
 }
 
+class ApplyCallback : public Ha_clone_cbk {
+ public:
+  int file_cbk(Ha_clone_file, uint) override { return 1; }
+  int buffer_cbk(uchar *, uint) override { return 1; }
+  int apply_buffer_cbk(uchar *&, uint &) override { return 1; }
+  int apply_file_cbk(Ha_clone_file file) override {
+    const uchar data[] = "payload";
+    return my_write(file.file_desc, data, sizeof(data), MYF(0)) == sizeof(data)
+               ? 0 : 1;
+  }
+};
+
+
+TEST_F(CloneContract, ValidDescriptorWritesInsideStage) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_START, nullptr));
+  myrocks::Rdb_clone_data_desc descriptor{};
+  descriptor.version = 1;
+  descriptor.file_size = 8;
+  strcpy(descriptor.rel_path, "000001.sst");
+  ApplyCallback callback;
+  callback.set_data_desc(reinterpret_cast<const uchar *>(&descriptor),
+                         sizeof(descriptor));
+  EXPECT_EQ(0, myrocks::rocksdb_clone_apply(nullptr, nullptr, locator,
+      length, task, 0, &callback));
+  EXPECT_EQ(8U, fs::file_size(myrocks::test_datadir + "_clone_recv/000001.sst"));
+  myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator, length, task, 0);
+}
+
+TEST_F(CloneContract, RejectParentPath) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_START, nullptr));
+  myrocks::Rdb_clone_data_desc descriptor{};
+  descriptor.version = 1;
+  descriptor.file_size = 8;
+  strcpy(descriptor.rel_path, "../outside");
+  ApplyCallback callback;
+  callback.set_data_desc(reinterpret_cast<const uchar *>(&descriptor),
+                         sizeof(descriptor));
+  EXPECT_NE(0, myrocks::rocksdb_clone_apply(nullptr, nullptr, locator,
+      length, task, 0, &callback));
+  EXPECT_FALSE(fs::exists(root + "/outside"));
+  myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator, length, task, 1);
+}
+
+TEST_F(CloneContract, RejectUnknownDescriptorVersion) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_START, nullptr));
+  myrocks::Rdb_clone_data_desc descriptor{};
+  descriptor.version = 999;
+  descriptor.file_size = 8;
+  strcpy(descriptor.rel_path, "000001.sst");
+  ApplyCallback callback;
+  callback.set_data_desc(reinterpret_cast<const uchar *>(&descriptor),
+                         sizeof(descriptor));
+  EXPECT_NE(0, myrocks::rocksdb_clone_apply(nullptr, nullptr, locator,
+      length, task, 0, &callback));
+  myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator, length, task, 1);
+}
+
+TEST_F(CloneContract, RejectTruncatedDescriptor) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_START, nullptr));
+  uchar descriptor = 1;
+  ApplyCallback callback;
+  callback.set_data_desc(&descriptor, sizeof(descriptor));
+  EXPECT_NE(0, myrocks::rocksdb_clone_apply(nullptr, nullptr, locator,
+      length, task, 0, &callback));
+  myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator, length, task, 1);
+}
+
+
+TEST_F(CloneContract, RejectMalformedNamesAndDescriptorBounds) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_START, nullptr));
+  myrocks::Rdb_clone_data_desc descriptor{};
+  descriptor.version = myrocks::RDB_CLONE_DESC_VERSION;
+  descriptor.file_size = 8;
+  ApplyCallback callback;
+  for (const auto &name : {std::string("/tmp/escape"), std::string(".."),
+                          std::string("a/000001.sst"),
+                          std::string("CLONE_COMPLETE"),
+                          std::string(FN_REFLEN, 'x')}) {
+    memset(descriptor.rel_path, 0, sizeof(descriptor.rel_path));
+    memcpy(descriptor.rel_path, name.data(), name.size());
+    callback.set_data_desc(reinterpret_cast<const uchar *>(&descriptor),
+                           sizeof(descriptor));
+    EXPECT_EQ(ER_CLONE_PROTOCOL, myrocks::rocksdb_clone_apply(nullptr, nullptr,
+        locator, length, task, 0, &callback));
+  }
+  strcpy(descriptor.rel_path, "000001.sst");
+  callback.set_data_desc(reinterpret_cast<const uchar *>(&descriptor),
+                         sizeof(descriptor) + 1);
+  EXPECT_EQ(ER_CLONE_PROTOCOL, myrocks::rocksdb_clone_apply(nullptr, nullptr,
+      locator, length, task, 0, &callback));
+  callback.set_data_desc(nullptr, 0);
+  EXPECT_EQ(ER_CLONE_PROTOCOL, myrocks::rocksdb_clone_apply(nullptr, nullptr,
+      locator, length, task, 0, &callback));
+  myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator, length, task, 1);
+}
+
+TEST_F(CloneContract, RejectSymlinkDestinationAndWrongPayloadSize) {
+  uint length = 0, task = 0;
+  std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
+  const uchar *locator = donor.get();
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_START, nullptr));
+  const auto stage = myrocks::test_datadir + "_clone_recv";
+  std::ofstream(root + "/outside") << "keep";
+  fs::create_symlink(root + "/outside", stage + "/000001.sst");
+  myrocks::Rdb_clone_data_desc descriptor{};
+  descriptor.version = myrocks::RDB_CLONE_DESC_VERSION;
+  descriptor.file_size = 8;
+  strcpy(descriptor.rel_path, "000001.sst");
+  ApplyCallback callback;
+  callback.set_data_desc(reinterpret_cast<const uchar *>(&descriptor),
+                         sizeof(descriptor));
+  EXPECT_NE(0, myrocks::rocksdb_clone_apply(nullptr, nullptr, locator,
+      length, task, 0, &callback));
+  EXPECT_EQ(4U, fs::file_size(root + "/outside"));
+  fs::remove(stage + "/000001.sst");
+  descriptor.file_size = 9;
+  EXPECT_EQ(ER_CLONE_PROTOCOL, myrocks::rocksdb_clone_apply(nullptr, nullptr,
+      locator, length, task, 0, &callback));
+  myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator, length, task, 1);
+}
+
 int main(int argc, char **argv) {
   MY_INIT(argv[0]);
   ::testing::InitGoogleTest(&argc, argv);
