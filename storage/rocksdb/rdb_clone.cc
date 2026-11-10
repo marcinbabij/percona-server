@@ -73,13 +73,65 @@ struct Rdb_clone_session {
 
 /* Recipient-side clone session.
    In provisioning mode (data_dir==nullptr), files are staged in `write_dir`
-   (a temporary sibling directory) and atomically renamed into `rocksdb_dir`
-   in apply_end so the live RocksDB instance is never disturbed mid-clone. */
+   (a temporary sibling directory). apply_end durably marks success, and
+   startup installs the completed stage after the live instance has closed. */
 struct Rdb_clone_apply_session {
   std::string rocksdb_dir;   /* final destination */
   std::string write_dir;     /* where files are written during apply */
   bool is_provisioning;      /* true when data_dir was nullptr */
 };
+
+/** Completion marker appended to a receive directory path. Its presence in a
+provisioning stage, created after all received files are durable, is the only
+authorization to replace the live database at the next startup. The name can
+never be received from the donor, see valid_clone_filename(). */
+static constexpr const char *RDB_CLONE_COMPLETE = "/CLONE_COMPLETE";
+
+/** Get the directory whose entry must be synced to persist a rename or a
+creation of path.
+@param[in]  path  directory path, may end with '/'
+@return parent directory path ending with '/', or "." for a relative name */
+static std::string clone_parent_dir(const std::string &path) {
+  const auto end = path.find_last_not_of('/');
+  const auto slash = path.rfind('/', end);
+  return slash == std::string::npos ? "." : path.substr(0, slash + 1);
+}
+
+/** Persist directory entries created, removed or renamed in a directory.
+@param[in]  path  directory to sync
+@return true on success, false after reporting the error */
+static bool sync_clone_directory(const std::string &path) {
+  const File fd = my_open(path.c_str(), O_RDONLY | O_DIRECTORY, MYF(MY_WME));
+  if (fd < 0) return false;
+  const int err = my_sync(fd, MYF(MY_WME));
+  const int close_err = my_close(fd, MYF(MY_WME));
+  return err == 0 && close_err == 0;
+}
+
+/** Check if a receive directory holds a durable completion marker.
+@param[in]  path  receive directory
+@return true if the marker is a regular file */
+static bool clone_is_complete(const std::string &path) {
+  MY_STAT st;
+  const std::string marker = path + RDB_CLONE_COMPLETE;
+  return my_stat(marker.c_str(), &st, MYF(0)) != nullptr &&
+         S_ISREG(st.st_mode);
+}
+
+/** Remove a receive directory. The marker is removed first, so a crash in
+the middle never leaves a partial stage which looks complete.
+@param[in]  path  receive directory */
+static void remove_clone_stage(const std::string &path) {
+  my_delete((path + RDB_CLONE_COMPLETE).c_str(), MYF(0));
+  rocksdb::DestroyDB(path, rocksdb::Options());
+}
+
+/** Report a failure to write or persist clone files.
+@return error code reported to the session */
+static int clone_io_error() {
+  my_error(ER_INTERNAL_ERROR, MYF(0), "Cannot persist RocksDB clone files");
+  return ER_INTERNAL_ERROR;
+}
 
 static std::mutex g_clone_mutex;
 static std::atomic<uint32_t> g_next_session_id{1};
@@ -110,6 +162,13 @@ bool rdb_clone_apply_pending(const char *rocksdb_dir) {
       !S_ISDIR(st.st_mode))
     return false;  /* no pending clone */
 
+  /* A receive directory exists before any files arrive. Only a durable
+  successful end authorizes replacing the live database on restart. */
+  if (!clone_is_complete(staging_dir)) {
+    remove_clone_stage(staging_dir);
+    return false;
+  }
+
   const std::string backup_dir = live_dir + "_clone_old";
 
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
@@ -136,6 +195,8 @@ bool rdb_clone_apply_pending(const char *rocksdb_dir) {
 
   rocksdb::DestroyDB(backup_dir, rocksdb::Options());
 
+  my_delete((live_dir + RDB_CLONE_COMPLETE).c_str(), MYF(MY_WME));
+  sync_clone_directory(live_dir);
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB init: pending clone installed at %s",
                   live_dir.c_str());
@@ -389,13 +450,14 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
 
   /* In provisioning mode the live RocksDB is running, so writing donor files
      directly into its directory risks the compactor deleting our files.
-     Stage into a sibling directory and rename atomically in apply_end. */
+     Stage into a sibling directory, publish completion in apply_end, and
+     install the received database during the next startup. */
   const std::string write_dir =
       is_provisioning ? rocksdb_dir + "_clone_recv" : rocksdb_dir;
 
   /* Remove any leftover staging dir from a previous failed attempt. */
   if (is_provisioning) {
-    rocksdb::DestroyDB(write_dir, rocksdb::Options());
+    remove_clone_stage(write_dir);
   }
 
   if (my_mkdir(write_dir.c_str(), 0750, MYF(0)) != 0 && errno != EEXIST) {
@@ -483,8 +545,11 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB clone_apply: calling apply_file_cbk for '%s'",
                   desc->rel_path);
-  const int err = cbk->apply_file_cbk(dest_file);
-  my_close(dest_fd, MYF(0));
+  int err = cbk->apply_file_cbk(dest_file);
+  if (err == 0 && my_sync(dest_fd, MYF(MY_WME)) != 0)
+    err = clone_io_error();
+  if (my_close(dest_fd, MYF(MY_WME)) != 0 && err == 0)
+    err = clone_io_error();
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB clone_apply: apply_file_cbk for '%s' returned %d",
                   desc->rel_path, err);
@@ -520,20 +585,26 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
     LogPluginErrMsg(INFORMATION_LEVEL, 0,
                     "RocksDB clone_apply_end: clone error %d, "
                     "removing staging dir %s", in_err, write_dir.c_str());
-    rocksdb::DestroyDB(write_dir, rocksdb::Options());
+    remove_clone_stage(write_dir);
     return 0;
   }
 
-  /* Provisioning clone succeeded.  Leave the staging directory in place as a
-     "pending swap" signal.  The live RocksDB instance is still running and
-     will flush its memtable during shutdown — swapping the directory now would
-     let that flush write local-server files into the donor's directory,
-     corrupting the MANIFEST.  rdb_clone_apply_pending() performs the rename
-     during rocksdb_init_internal() before TransactionDB::Open(), once the
-     old instance is fully closed. */
+  /* Publish completion only after the received files and directory entries
+  are durable. The live engine stays open until mysqld shuts down. */
+  const std::string marker = write_dir + RDB_CLONE_COMPLETE;
+  const File fd = my_create(marker.c_str(), 0600, O_WRONLY | O_EXCL,
+                            MYF(MY_WME));
+  if (fd < 0) return clone_io_error();
+  bool failed = my_sync(fd, MYF(MY_WME)) != 0;
+  if (my_close(fd, MYF(MY_WME)) != 0) failed = true;
+  if (failed || !sync_clone_directory(write_dir) ||
+      !sync_clone_directory(clone_parent_dir(write_dir))) {
+    remove_clone_stage(write_dir);
+    return clone_io_error();
+  }
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB clone_apply_end: staging dir %s ready; "
-                  "swap into %s deferred to next init",
+                  "RocksDB clone_apply_end: staging dir %s complete; "
+                  "install into %s deferred to next startup",
                   write_dir.c_str(), rocksdb_dir.c_str());
   return 0;
 }
