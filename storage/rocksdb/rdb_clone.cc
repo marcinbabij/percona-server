@@ -493,7 +493,9 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
   task_id = 0;
 
   /* Place the checkpoint as a sibling of rocksdb_datadir so that RocksDB
-     can hard-link SST files (same filesystem, no data copying needed). */
+     can hard-link SST files (same filesystem, no data copying needed).
+     If rocksdb_datadir is a mount point, the sibling is on the parent file
+     system, and RocksDB copies every file instead. */
   const std::string checkpoint_dir =
       clone_live_dir(rdb_get_rocksdb_datadir()) + RDB_CLONE_CHECKPOINT +
       std::to_string(session_id);
@@ -682,10 +684,23 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
   if (mode == HA_CLONE_MODE_VERSION) {
     const char *live_dir = rdb_get_rocksdb_datadir();
     if (data_dir == nullptr && live_dir != nullptr) {
-      const auto backup_dir = clone_live_dir(live_dir) + "_clone_old";
+      const auto live = clone_live_dir(live_dir);
+      const auto backup_dir = live + "_clone_old";
       if (clone_directory_exists(backup_dir)) {
         my_error(ER_FILE_EXISTS_ERROR, MYF(0), backup_dir.c_str());
         return ER_FILE_EXISTS_ERROR;
+      }
+      /* Installation renames whole directories next to rocksdb_datadir.
+      rename(2) fails for a mount point with EBUSY or EXDEV. InnoDB renames
+      files only within their directories and has no such limitation. */
+      MY_STAT live_stat, parent_stat;
+      if (my_stat(live.c_str(), &live_stat, MYF(0)) != nullptr &&
+          my_stat(clone_parent_dir(live).c_str(), &parent_stat, MYF(0)) !=
+              nullptr &&
+          live_stat.st_dev != parent_stat.st_dev) {
+        my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                 "RocksDB provisioning clone into a mount point");
+        return ER_NOT_SUPPORTED_YET;
       }
     }
     task_id = 0;
