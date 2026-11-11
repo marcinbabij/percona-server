@@ -1,0 +1,71 @@
+# MyRocks fails to prepare its stage after InnoDB prepared its part of a
+# provisioning clone. The clone must not be committed: after a restart,
+# neither engine may use donor data.
+--source include/have_debug_sync.inc
+--source include/have_rocksdb.inc
+--source include/linux.inc
+--source include/not_as_root.inc
+--let $port = `SELECT @@port`
+--source ../include/ps11475_suppress.inc
+--replace_result $CLONE_PLUGIN CLONE_PLUGIN
+--eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN'
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO clone_r VALUES (7);
+INSERT INTO clone_i VALUES (7);
+--connect (recipient,127.0.0.1,root,,test,$SERVER_PORT_2)
+--source ../include/ps11475_suppress.inc
+--replace_result $CLONE_PLUGIN CLONE_PLUGIN
+--eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN'
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+--replace_result $port PORT
+--eval SET GLOBAL clone_valid_donor_list = '127.0.0.1:$port'
+--let $stage = `SELECT CONCAT(@@datadir, @@rocksdb_datadir, '_clone_recv')`
+SET DEBUG_SYNC = 'clone_before_apply_end SIGNAL apply_end WAIT_FOR go';
+--replace_result $port PORT
+--send_eval CLONE INSTANCE FROM 'root'@'127.0.0.1':$port IDENTIFIED BY ''
+--connect (recipient_control,127.0.0.1,root,,*NO-ONE*,$SERVER_PORT_2)
+SET DEBUG_SYNC = 'now WAIT_FOR apply_end';
+# MyRocks cannot persist the directory entries of an unreadable stage.
+--exec chmod a-r "$stage"
+SET DEBUG_SYNC = 'now SIGNAL go';
+--disconnect recipient_control
+--connection recipient
+--replace_regex /File '.*'/File 'STAGE'/
+--error 29
+--reap
+--exec chmod u+r "$stage"
+# User data was dropped before the transfer. No donor table may appear.
+--disconnect recipient
+--connect (recipient,127.0.0.1,root,,*NO-ONE*,$SERVER_PORT_2)
+--let $restart_parameters = restart:
+--source include/restart_mysqld.inc
+--exec test ! -d "$stage"
+--let $assert_file = $MYSQLTEST_VARDIR/log/mysqld.2.err
+--let $assert_only_after = CURRENT_TEST: rocksdb_clone.ps11475_apply_end_failure
+--let $assert_count = 1
+--let $assert_text = MyRocks discarded the uncommitted stage
+--let $assert_select = RocksDB clone: discarding uncommitted
+--source include/assert_grep.inc
+SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.tables
+  WHERE TABLE_NAME IN ('clone_r', 'clone_i');
+# A complete clone restores the recipient, including the MTR schema.
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+--replace_result $port PORT
+--eval SET GLOBAL clone_valid_donor_list = '127.0.0.1:$port'
+--source include/expect_crash.inc
+--replace_result $port PORT
+--error 0,ER_RESTART_SERVER_FAILED,CR_SERVER_LOST,CR_SERVER_GONE_ERROR
+--eval CLONE INSTANCE FROM 'root'@'127.0.0.1':$port IDENTIFIED BY ''
+--source include/wait_until_disconnected.inc
+--source include/start_mysqld.inc
+SELECT id FROM test.clone_r;
+SELECT id FROM test.clone_i;
+DROP TABLE test.clone_i, test.clone_r;
+UNINSTALL PLUGIN clone;
+--disconnect recipient
+--connection default
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;

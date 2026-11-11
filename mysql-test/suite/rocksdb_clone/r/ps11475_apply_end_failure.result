@@ -1,0 +1,34 @@
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+CREATE TABLE clone_i (id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO clone_r VALUES (7);
+INSERT INTO clone_i VALUES (7);
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+SET GLOBAL clone_valid_donor_list = '127.0.0.1:PORT';
+SET DEBUG_SYNC = 'clone_before_apply_end SIGNAL apply_end WAIT_FOR go';
+CLONE INSTANCE FROM 'root'@'127.0.0.1':PORT IDENTIFIED BY '';
+SET DEBUG_SYNC = 'now WAIT_FOR apply_end';
+SET DEBUG_SYNC = 'now SIGNAL go';
+ERROR HY000: File 'STAGE' not found (OS errno 13 - Permission denied)
+# restart:
+include/assert_grep.inc [MyRocks discarded the uncommitted stage]
+SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.tables
+WHERE TABLE_NAME IN ('clone_r', 'clone_i');
+TABLE_SCHEMA	TABLE_NAME
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+SET GLOBAL clone_valid_donor_list = '127.0.0.1:PORT';
+CLONE INSTANCE FROM 'root'@'127.0.0.1':PORT IDENTIFIED BY '';
+# restart:
+SELECT id FROM test.clone_r;
+id
+7
+SELECT id FROM test.clone_i;
+id
+7
+DROP TABLE test.clone_i, test.clone_r;
+UNINSTALL PLUGIN clone;
+DROP TABLE clone_i, clone_r;
+UNINSTALL PLUGIN clone;

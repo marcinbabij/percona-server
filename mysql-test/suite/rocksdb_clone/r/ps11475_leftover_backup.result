@@ -1,0 +1,24 @@
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO clone_r VALUES (7);
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+SET GLOBAL clone_autotune_concurrency = OFF;
+SET GLOBAL clone_max_concurrency = 1;
+SET GLOBAL clone_valid_donor_list = '127.0.0.1:PORT';
+CLONE INSTANCE FROM 'root'@'127.0.0.1':PORT IDENTIFIED BY '';
+# restart:
+USE test;
+SELECT id FROM clone_r ORDER BY id;
+id
+7
+include/assert_grep.inc [The leftover backup is reported at startup]
+SET GLOBAL clone_valid_donor_list = '127.0.0.1:PORT';
+CLONE INSTANCE FROM 'root'@'127.0.0.1':PORT IDENTIFIED BY '';
+ERROR HY000: File './.rocksdb_clone_old' already exists
+SELECT id FROM clone_r ORDER BY id;
+id
+7
+DROP TABLE clone_r;
+UNINSTALL PLUGIN clone;
+DROP TABLE clone_r;
+UNINSTALL PLUGIN clone;

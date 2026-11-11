@@ -34,6 +34,7 @@ Clone Plugin: Client implementation
 
 #include "my_byteorder.h"
 #include "my_systime.h"  // my_sleep()
+#include "sql/debug_sync.h"
 #include "sql/sql_thd_internal_api.h"
 #include "sql_string.h"
 
@@ -860,6 +861,7 @@ int Client::clone() {
 
   /* Check if storage is initialized and close. */
   if (m_storage_initialized) {
+    DEBUG_SYNC(get_thd(), "clone_before_apply_end");
     const auto end_error =
         hton_clone_apply_end(m_server_thd, m_share->m_storage_vec, m_tasks, err);
     if (err == 0) err = end_error;

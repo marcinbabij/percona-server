@@ -1,0 +1,24 @@
+# A donor crash leaves its RocksDB checkpoint behind. Session identifiers
+# restart from 1 after a restart, so the first clone afterwards would use
+# the same directory. Startup must remove the stale checkpoint.
+--source include/have_rocksdb.inc
+--disable_query_log
+CALL mtr.add_suppression('RocksDB clone: removing stale checkpoint');
+--enable_query_log
+--replace_result $CLONE_PLUGIN CLONE_PLUGIN
+--eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN'
+CREATE TABLE clone_r (id INT PRIMARY KEY) ENGINE=RocksDB;
+INSERT INTO clone_r VALUES (7);
+--let $checkpoint = `SELECT CONCAT(@@datadir, @@rocksdb_datadir, '_clone_ckpt_1')`
+--mkdir $checkpoint
+--write_file $checkpoint/CURRENT
+MANIFEST-000001
+EOF
+--source include/restart_mysqld.inc
+--exec test ! -d "$checkpoint"
+--let $clone_dir = $MYSQL_TMP_DIR/ps11475_stale_checkpoint
+--replace_result $clone_dir CLONE_DIR
+--eval CLONE LOCAL DATA DIRECTORY = '$clone_dir'
+--force-rmdir $clone_dir
+DROP TABLE clone_r;
+UNINSTALL PLUGIN clone;
