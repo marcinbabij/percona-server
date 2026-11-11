@@ -40,22 +40,30 @@
 
 namespace myrocks {
 
-/* Magic value embedded in every locator blob so we can detect corruption. */
-static const uint32_t RDB_CLONE_LOCATOR_MAGIC = 0x524B4C4F;  /* "RKLO" */
-static const uint32_t RDB_CLONE_VERSION = 2;
-static const uint32_t RDB_CLONE_DESC_VERSION = 2;
+/** Magic value embedded in every locator blob so we can detect corruption. */
+static constexpr uint32_t RDB_CLONE_LOCATOR_MAGIC = 0x524B4C4F; /* "RKLO" */
+/** Locator format version. Donor and recipient must use the same one: the
+recipient rejects any other version as a protocol error. */
+static constexpr uint32_t RDB_CLONE_VERSION = 2;
+/** Rdb_clone_data_desc format version, validated by the recipient. */
+static constexpr uint32_t RDB_CLONE_DESC_VERSION = 2;
 
 /** Largest payload sent with one descriptor. Bounds the network packet and
 the copy buffer independently of the SST size; the recipient rejects larger
 chunks. It must stay below the minimum max_allowed_packet accepted by clone. */
 static constexpr uint32_t RDB_CLONE_CHUNK_SIZE = 1024 * 1024;
 
-/* Binary layout of the opaque locator blob the clone plugin passes back
-   to us on every subsequent call.  Must be POD and have stable layout. */
+/** Binary layout of the opaque locator blob the clone plugin passes back
+to us on every subsequent call. Must be POD and have stable layout. */
 #pragma pack(push, 1)
 struct Rdb_clone_locator {
+  /** RDB_CLONE_LOCATOR_MAGIC */
   uint32_t magic;
+  /** RDB_CLONE_VERSION */
   uint32_t version;
+  /** Donor session; the recipient keys its session by the same value. Zero
+  for a version-negotiation locator, which the caller owns and the end
+  callback frees. */
   uint32_t session_id;
 };
 
@@ -81,8 +89,12 @@ struct Rdb_clone_data_desc {
 };
 #pragma pack(pop)
 
+/** Donor checkpoint file to send. */
 struct Rdb_clone_file_info {
+  /** File name in the checkpoint directory */
   std::string rel_path;
+  /** File size when the checkpoint was listed; checkpoint files are not
+  modified afterwards */
   uint64_t file_size;
 };
 
@@ -105,18 +117,24 @@ struct Rdb_clone_tasks {
 
 /** Donor-side clone session: holds the checkpoint directory and file list. */
 struct Rdb_clone_session : Rdb_clone_tasks {
+  /** Checkpoint directory, a sibling of rocksdb_datadir, destroyed by the
+  last end call */
   std::string checkpoint_dir;
+  /** Checkpoint files, sent in this order by the master task */
   std::vector<Rdb_clone_file_info> files;
 };
 
-/* Recipient-side clone session.
-   In provisioning mode (data_dir==nullptr), files are staged in `write_dir`
-   (a temporary sibling directory). apply_end durably marks success, and
-   startup installs the completed stage after the live instance has closed. */
+/** Recipient-side clone session.
+In provisioning mode (data_dir==nullptr), files are staged in write_dir
+(a temporary sibling directory). apply_end durably marks success, and
+startup installs the completed stage after the live instance has closed. */
 struct Rdb_clone_apply_session : Rdb_clone_tasks {
-  std::string rocksdb_dir;   /* final destination */
-  std::string write_dir;     /* where files are written during apply */
-  bool is_provisioning;      /* true when data_dir was nullptr */
+  /** Final destination */
+  std::string rocksdb_dir;
+  /** Where files are written during apply */
+  std::string write_dir;
+  /** True when data_dir was nullptr */
+  bool is_provisioning;
   /** DATA DIRECTORY of a local or remote non-provisioning clone, created by
   InnoDB; empty for provisioning */
   std::string local_root;
@@ -188,9 +206,13 @@ static int clone_io_error() {
   return ER_INTERNAL_ERROR;
 }
 
+/** Protects g_clone_sessions, g_apply_sessions and the sessions in them. */
 static std::mutex g_clone_mutex;
+/** Next donor session identifier; zero is reserved for version locators. */
 static std::atomic<uint32_t> g_next_session_id{1};
+/** Donor sessions by session identifier */
 static std::unordered_map<uint32_t, Rdb_clone_session> g_clone_sessions;
+/** Recipient sessions by donor session identifier */
 static std::unordered_map<uint32_t, Rdb_clone_apply_session> g_apply_sessions;
 
 void rdb_clone_init() {
@@ -347,6 +369,10 @@ int rdb_clone_finish_pending(const char *rocksdb_dir) {
 
 /* ---- Internal helpers ---- */
 
+/** Allocate a locator.
+@param[in]   session_id  session identifier, zero for version negotiation
+@param[out]  loc_len     locator length
+@return locator allocated with new[] */
 static uchar *alloc_locator(uint32_t session_id, uint &loc_len) {
   loc_len = sizeof(Rdb_clone_locator);
   auto *buf = new uchar[loc_len];
@@ -357,6 +383,10 @@ static uchar *alloc_locator(uint32_t session_id, uint &loc_len) {
   return buf;
 }
 
+/** Check a locator received from the clone plugin.
+@param[in]  loc      locator
+@param[in]  loc_len  locator length
+@return true if loc is a locator of this format version */
 static bool validate_locator(const uchar *loc, uint loc_len) {
   if (loc == nullptr || loc_len != sizeof(Rdb_clone_locator)) return false;
   const auto *l = reinterpret_cast<const Rdb_clone_locator *>(loc);
@@ -364,6 +394,9 @@ static bool validate_locator(const uchar *loc, uint loc_len) {
          l->version == RDB_CLONE_VERSION;
 }
 
+/** Get the session identifier of a validated locator.
+@param[in]  loc  locator, see validate_locator()
+@return session identifier */
 static uint32_t locator_session_id(const uchar *loc) {
   return reinterpret_cast<const Rdb_clone_locator *>(loc)->session_id;
 }

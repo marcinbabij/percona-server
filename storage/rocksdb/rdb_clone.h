@@ -20,7 +20,7 @@
 
 namespace myrocks {
 
-/* Initialize the clone module. Call once from rocksdb_init_internal(). */
+/** Initialize the clone module. Call once from rocksdb_init_internal(). */
 void rdb_clone_init();
 
 /** Outcome of the startup check for a pending provisioning clone. */
@@ -48,10 +48,13 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir);
 @return zero on success, or a MySQL error code on persistence failure */
 int rdb_clone_finish_pending(const char *rocksdb_dir);
 
-/* Destroy the clone module. Call once from rocksdb_shutdown(). */
+/** Destroy the clone module: drop all sessions and their donor
+checkpoints. Call once from rocksdb_shutdown(). */
 void rdb_clone_destroy();
 
-/* The 8 clone-interface callbacks registered in the RocksDB handlerton. */
+/* The 8 clone-interface callbacks registered in the RocksDB handlerton.
+See Clone_interface_t in sql/handler.h for the contracts. Every error
+returned is also raised in the session diagnostics area. */
 
 void rocksdb_clone_get_capability(Ha_clone_flagset &flags);
 
