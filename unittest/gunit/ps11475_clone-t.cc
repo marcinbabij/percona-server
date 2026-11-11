@@ -34,16 +34,24 @@ const char *rdb_get_rocksdb_datadir() { return test_datadir.c_str(); }
 class CloneContract : public ::testing::Test {
  protected:
   std::string root;
+  fs::path saved_cwd;
   void SetUp() override {
     clone_messages.clear();
     char pattern[] = "/tmp/ps11475-contract-XXXXXX";
     root = mkdtemp(pattern);
     myrocks::test_datadir = root + "/live";
+    // The commit marker is relative to the server data directory.
+    saved_cwd = fs::current_path();
+    fs::current_path(root);
+    fs::create_directory("#clone");
   }
   void TearDown() override {
     myrocks::rdb_clone_destroy();
+    fs::current_path(saved_cwd);
     fs::remove_all(root);
   }
+  // Commit the clone for all engines, as the clone plugin does.
+  void commit() { std::ofstream(Clone_handler::READY_TO_APPLY_FILE).close(); }
   void create_database(const std::string &path) {
     rocksdb::Options options;
     options.create_if_missing = true;
@@ -79,7 +87,7 @@ TEST_F(CloneContract, RestartBetweenRenamesMustPreserveOldDatabase) {
   const auto live = myrocks::test_datadir;
   create_database(live);
   create_database(live + "_clone_recv");
-  std::ofstream(live + "_clone_recv/CLONE_COMPLETE").close();
+  commit();
   // This is the on-disk state after the first rename and before the second.
   fs::rename(live, live + "_clone_old");
   const auto installed = myrocks::rdb_clone_apply_pending(live.c_str());
@@ -91,6 +99,24 @@ TEST_F(CloneContract, RestartBetweenRenamesMustPreserveOldDatabase) {
   EXPECT_EQ(0, myrocks::rdb_clone_finish_pending(live.c_str()));
   EXPECT_FALSE(fs::exists(live + "_clone_old"));
   EXPECT_TRUE(fs::exists(live + "/CURRENT"));
+}
+
+TEST_F(CloneContract, PreparedStageInstallsOnlyAfterCommit) {
+  const auto live = myrocks::test_datadir;
+  create_database(live);
+  create_database(live + "_clone_recv");
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::NONE,
+            myrocks::rdb_clone_apply_pending(live.c_str()));
+  EXPECT_FALSE(fs::exists(live + "_clone_recv"));
+  EXPECT_FALSE(fs::exists(live + "_clone_old"));
+  create_database(live + "_clone_recv");
+  commit();
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::INSTALLED,
+            myrocks::rdb_clone_apply_pending(live.c_str()));
+  EXPECT_FALSE(fs::exists(live + "_clone_recv"));
+  EXPECT_TRUE(fs::exists(live + "_clone_old/CURRENT"));
+  EXPECT_EQ(0, myrocks::rdb_clone_finish_pending(live.c_str()));
+  EXPECT_FALSE(fs::exists(live + "_clone_old"));
 }
 
 TEST_F(CloneContract, MissingStageRestoresSavedDatabase) {
@@ -106,7 +132,7 @@ TEST_F(CloneContract, AmbiguousRecoveryPreservesEveryDatabase) {
   create_database(live);
   create_database(live + "_clone_old");
   create_database(live + "_clone_recv");
-  std::ofstream(live + "_clone_recv/CLONE_COMPLETE").close();
+  commit();
   EXPECT_EQ(myrocks::Rdb_clone_recovery::ERROR,
             myrocks::rdb_clone_apply_pending(live.c_str()));
   EXPECT_TRUE(fs::exists(live + "/CURRENT"));
@@ -130,11 +156,10 @@ TEST_F(CloneContract, ApplyWorkersShareStageAndKeepItUntilLastEnd) {
   EXPECT_TRUE(fs::exists(stage + "/CURRENT"));
   EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, master,
       length, master_task, ER_QUERY_INTERRUPTED));
-  EXPECT_FALSE(fs::exists(stage + "/CLONE_COMPLETE"));
   EXPECT_TRUE(fs::exists(stage));
   EXPECT_EQ(ER_QUERY_INTERRUPTED, myrocks::rocksdb_clone_apply_end(nullptr,
       nullptr, worker, length, worker_task, 0));
-  EXPECT_FALSE(fs::exists(stage + "/CLONE_COMPLETE"));
+  EXPECT_FALSE(fs::exists(stage));
   EXPECT_TRUE(myrocks::g_apply_sessions.empty());
 }
 
@@ -260,7 +285,7 @@ TEST_F(CloneContract, RejectMalformedNamesAndDescriptorBounds) {
   ApplyCallback callback;
   for (const auto &name : {std::string("/tmp/escape"), std::string(".."),
                           std::string("a/000001.sst"),
-                          std::string("CLONE_COMPLETE"),
+                          std::string("LOCK"),
                           std::string(FN_REFLEN, 'x')}) {
     memset(descriptor.rel_path, 0, sizeof(descriptor.rel_path));
     memcpy(descriptor.rel_path, name.data(), name.size());
@@ -309,7 +334,7 @@ TEST_F(CloneContract, RejectSymlinkDestinationAndWrongPayloadSize) {
   myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator, length, task, 1);
 }
 
-TEST_F(CloneContract, ChunksAreOrderedAndCompleteBeforePublication) {
+TEST_F(CloneContract, ChunksAreOrderedAndCompleteBeforePrepare) {
   uint length = 0, task = 0;
   std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
   const uchar *locator = donor.get();
@@ -327,7 +352,6 @@ TEST_F(CloneContract, ChunksAreOrderedAndCompleteBeforePublication) {
   ASSERT_EQ(0, myrocks::rocksdb_clone_apply(nullptr, nullptr, locator,
       length, task, 0, &callback));
   const auto stage = myrocks::test_datadir + "_clone_recv";
-  EXPECT_FALSE(fs::exists(stage + "/CLONE_COMPLETE"));
   // Duplicating a chunk or skipping an offset must not truncate the file.
   EXPECT_EQ(ER_CLONE_PROTOCOL, myrocks::rocksdb_clone_apply(nullptr, nullptr,
       locator, length, task, 0, &callback));
@@ -344,10 +368,12 @@ TEST_F(CloneContract, ChunksAreOrderedAndCompleteBeforePublication) {
   EXPECT_EQ(callback.payload + callback.payload, data);
   EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator,
       length, task, 0));
-  EXPECT_TRUE(fs::exists(stage + "/CLONE_COMPLETE"));
+  // Only the clone plugin commits: the engine keeps the prepared stage.
+  EXPECT_TRUE(fs::exists(stage + "/000001.sst"));
+  EXPECT_FALSE(fs::exists(Clone_handler::READY_TO_APPLY_FILE));
 }
 
-TEST_F(CloneContract, IncompleteChunksCannotPublishSuccess) {
+TEST_F(CloneContract, IncompleteChunksCannotPrepare) {
   uint length = 0, task = 0;
   std::unique_ptr<uchar[]> donor(myrocks::alloc_locator(123, length));
   const uchar *locator = donor.get();
@@ -366,7 +392,7 @@ TEST_F(CloneContract, IncompleteChunksCannotPublishSuccess) {
       length, task, 0, &callback));
   EXPECT_EQ(ER_CLONE_PROTOCOL, myrocks::rocksdb_clone_apply_end(nullptr,
       nullptr, locator, length, task, 0));
-  EXPECT_FALSE(fs::exists(myrocks::test_datadir + "_clone_recv/CLONE_COMPLETE"));
+  EXPECT_FALSE(fs::exists(myrocks::test_datadir + "_clone_recv"));
 }
 
 TEST_F(CloneContract, DonorChunksFilesLargerThanFourGiB) {

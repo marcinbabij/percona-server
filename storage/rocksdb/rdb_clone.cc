@@ -30,6 +30,7 @@
 #include "my_dir.h"
 #include "my_sys.h"
 #include "mysqld_error.h"
+#include "sql/clone_handler.h"
 
 /* RocksDB includes */
 #include "rocksdb/utilities/checkpoint.h"
@@ -126,8 +127,9 @@ struct Rdb_clone_session : Rdb_clone_tasks {
 
 /** Recipient-side clone session.
 In provisioning mode (data_dir==nullptr), files are staged in write_dir
-(a temporary sibling directory). apply_end durably marks success, and
-startup installs the completed stage after the live instance has closed. */
+(a temporary sibling directory). apply_end makes the stage durable, and the
+next startup installs it if the clone plugin committed the clone, see
+Clone_handler::READY_TO_APPLY_FILE. */
 struct Rdb_clone_apply_session : Rdb_clone_tasks {
   /** Final destination */
   std::string rocksdb_dir;
@@ -154,12 +156,6 @@ struct Rdb_clone_apply_session : Rdb_clone_tasks {
   std::unordered_set<std::string> received_names;
 };
 
-/** Completion marker appended to a receive directory path. Its presence in a
-provisioning stage, created after all received files are durable, is the only
-authorization to replace the live database at the next startup. The name can
-never be received from the donor, see valid_clone_filename(). */
-static constexpr const char *RDB_CLONE_COMPLETE = "/CLONE_COMPLETE";
-
 /** Get the directory whose entry must be synced to persist a rename or a
 creation of path.
 @param[in]  path  directory path, may end with '/'
@@ -181,21 +177,10 @@ static bool sync_clone_directory(const std::string &path) {
   return err == 0 && close_err == 0;
 }
 
-/** Check if a receive directory holds a durable completion marker.
-@param[in]  path  receive directory
-@return true if the marker is a regular file */
-static bool clone_is_complete(const std::string &path) {
-  MY_STAT st;
-  const std::string marker = path + RDB_CLONE_COMPLETE;
-  return my_stat(marker.c_str(), &st, MYF(0)) != nullptr &&
-         S_ISREG(st.st_mode);
-}
-
-/** Remove a receive directory. The marker is removed first, so a crash in
-the middle never leaves a partial stage which looks complete.
+/** Remove a receive directory. It holds only files received from the donor,
+see valid_clone_filename(), so DestroyDB() removes it completely.
 @param[in]  path  receive directory */
 static void remove_clone_stage(const std::string &path) {
-  my_delete((path + RDB_CLONE_COMPLETE).c_str(), MYF(0));
   rocksdb::DestroyDB(path, rocksdb::Options());
 }
 
@@ -268,17 +253,19 @@ static std::string clone_live_dir(const char *dir) {
 /* Installation is a sequence of two durable renames, each of them atomic:
      live -> live_clone_old (skipped if there is no live directory),
      live_clone_recv -> live.
-   The completion marker travels with the received directory and is removed
-   only after the old database is destroyed, so every crash point leaves one
-   of these states (S = stage, B = backup, L = live, C = has marker):
-     S(C)  L  : not started            -> both renames
-     S(C)     : no previous database   -> second rename
-     S(C)  B  : first rename done      -> second rename
-     B  L(C)  : both renames done      -> INSTALLED, finish removes B
-     L(C)     : B destroyed            -> NONE, finish removes marker
-     S        : receive not completed  -> stage discarded
-   Any other combination with B present cannot be explained by this sequence
-   and is rejected, except a lone B, which is restored. */
+   It starts only if the clone plugin committed the clone (M, see
+   Clone_handler::READY_TO_APPLY_FILE), which no engine changes once any
+   engine installed. The old database is destroyed only after the received
+   one opened. Every crash point leaves one of these states (S = stage,
+   B = backup, L = live):
+     S  L  M : not started            -> both renames
+     S     M : no previous database   -> second rename
+     S  B  M : first rename done      -> second rename
+     B  L  M : both renames done      -> INSTALLED, finish removes B
+     S  !M   : clone not committed    -> stage discarded
+     B  !L   : stage lost             -> B restored
+   Any other combination with B present cannot be explained by this
+   sequence and is rejected. */
 Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
   if (rocksdb_dir == nullptr) return Rdb_clone_recovery::NONE;
   const std::string live_dir = clone_live_dir(rocksdb_dir);
@@ -286,11 +273,10 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
   const std::string backup_dir = live_dir + "_clone_old";
   const bool have_live = clone_directory_exists(live_dir);
   const bool have_backup = clone_directory_exists(backup_dir);
+  const bool committed = Clone_handler::ready_to_apply();
 
   if (!clone_directory_exists(staging_dir)) {
     if (!have_backup) return Rdb_clone_recovery::NONE;
-    /* Installation finished, but engine recovery or backup cleanup did not. */
-    if (clone_is_complete(live_dir)) return Rdb_clone_recovery::INSTALLED;
     if (!have_live) {
       LogPluginErrMsg(WARNING_LEVEL, 0,
                       "RocksDB clone: restoring %s from %s",
@@ -299,23 +285,26 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
         return Rdb_clone_recovery::ERROR;
       return Rdb_clone_recovery::NONE;
     }
+    /* Installation finished, but engine recovery or backup cleanup did not. */
+    if (committed) return Rdb_clone_recovery::INSTALLED;
     LogPluginErrMsg(ERROR_LEVEL, 0,
-                    "RocksDB clone: both %s and %s exist without a completed "
+                    "RocksDB clone: both %s and %s exist without a committed "
                     "clone; remove the one which is not needed",
                     live_dir.c_str(), backup_dir.c_str());
     return Rdb_clone_recovery::ERROR;
   }
 
-  if (!clone_is_complete(staging_dir)) {
-    /* An unfinished receive cannot authorize any change to a saved DB. */
+  if (!committed) {
+    /* The clone failed, crashed before its commit, or was abandoned by
+    another engine. */
     if (have_backup) {
       LogPluginErrMsg(ERROR_LEVEL, 0,
-                      "RocksDB clone: incomplete %s found next to saved %s",
+                      "RocksDB clone: uncommitted %s found next to saved %s",
                       staging_dir.c_str(), backup_dir.c_str());
       return Rdb_clone_recovery::ERROR;
     }
     LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                    "RocksDB clone: discarding incomplete %s",
+                    "RocksDB clone: discarding uncommitted %s",
                     staging_dir.c_str());
     remove_clone_stage(staging_dir);
     return Rdb_clone_recovery::NONE;
@@ -329,7 +318,7 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
     destroy it or replace an unexpected live directory on a retry. */
     if (have_live) {
       LogPluginErrMsg(ERROR_LEVEL, 0,
-                      "RocksDB clone: %s, %s and completed %s all exist",
+                      "RocksDB clone: %s, %s and committed %s all exist",
                       live_dir.c_str(), backup_dir.c_str(),
                       staging_dir.c_str());
       return Rdb_clone_recovery::ERROR;
@@ -345,21 +334,13 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
 
 int rdb_clone_finish_pending(const char *rocksdb_dir) {
   const std::string live_dir = clone_live_dir(rocksdb_dir);
-  if (!clone_is_complete(live_dir)) return 0;
   const std::string backup_dir = live_dir + "_clone_old";
-  if (clone_directory_exists(backup_dir)) {
-    const auto status = rocksdb::DestroyDB(backup_dir, rocksdb::Options());
-    if (!status.ok() || !sync_clone_directory(clone_parent_dir(live_dir))) {
-      LogPluginErrMsg(ERROR_LEVEL, 0, "RocksDB clone: cannot remove %s: %s",
-                      backup_dir.c_str(), status.ToString().c_str());
-      return clone_io_error();
-    }
-  }
-  if (my_delete((live_dir + RDB_CLONE_COMPLETE).c_str(), MYF(MY_WME)) != 0 ||
-      !sync_clone_directory(live_dir)) {
-    LogPluginErrMsg(ERROR_LEVEL, 0,
-                    "RocksDB clone: cannot remove completion marker in %s: %d",
-                    live_dir.c_str(), errno);
+  if (!clone_directory_exists(backup_dir) || !Clone_handler::ready_to_apply())
+    return 0;
+  const auto status = rocksdb::DestroyDB(backup_dir, rocksdb::Options());
+  if (!status.ok() || !sync_clone_directory(clone_parent_dir(live_dir))) {
+    LogPluginErrMsg(ERROR_LEVEL, 0, "RocksDB clone: cannot remove %s: %s",
+                    backup_dir.c_str(), status.ToString().c_str());
     return clone_io_error();
   }
   LogPluginErrMsg(INFORMATION_LEVEL, 0, "RocksDB clone: installed %s",
@@ -420,7 +401,7 @@ static constexpr const char *RDB_CLONE_NO_TASK =
     "RocksDB clone task not attached";
 
 /* Only flat checkpoint files may be supplied by the donor. In particular,
-completion markers and paths outside the stage are never wire filenames. */
+paths outside the stage are never wire filenames. */
 static bool valid_clone_filename(const char *name, size_t capacity) {
   const char *end = static_cast<const char *>(memchr(name, '\0', capacity));
   if (end == nullptr || end == name) return false;
@@ -737,20 +718,14 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
 
   /* In provisioning mode the live RocksDB is running, so writing donor files
      directly into its directory risks the compactor deleting our files.
-     Stage into a sibling directory, publish completion in apply_end, and
-     install the received database during the next startup. */
+     Stage into a sibling directory, prepare it in apply_end, and install
+     it during the next startup if the clone plugin committed the clone. */
   const std::string write_dir =
       is_provisioning ? rocksdb_dir + "_clone_recv" : rocksdb_dir;
 
-  /* Remove any leftover staging dir from a previous failed attempt. */
-  if (is_provisioning) {
-    /* A completed stage is installed by the next startup. Never replace it
-    with a new receive: the InnoDB part of that clone is already final. */
-    if (clone_is_complete(write_dir))
-      return clone_protocol_error(
-          "RocksDB clone stage is waiting for a server restart");
-    remove_clone_stage(write_dir);
-  }
+  /* Remove a stage left by an earlier clone. It is not committed anymore:
+  the clone plugin withdrew any commit before this call. */
+  if (is_provisioning) remove_clone_stage(write_dir);
 
   if (is_provisioning &&
       my_mkdir(write_dir.c_str(), 0750, MYF(0)) != 0 && errno != EEXIST) {
@@ -898,7 +873,7 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
 
 int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
                             uint loc_len, uint task_id, int in_err) {
-  /* Held until the stage is published or removed. The session is erased
+  /* Held until the stage is prepared or removed. The session is erased
   first, and a new provisioning receive started meanwhile would otherwise
   remove the same stage directory in its apply_begin. */
   std::lock_guard<std::mutex> guard(g_clone_mutex);
@@ -950,21 +925,15 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
     return input_error == 0 ? in_err : 0;
   }
 
-  /* Publish completion only after the received files and directory entries
-  are durable. The live engine stays open until mysqld shuts down. */
-  const std::string marker = write_dir + RDB_CLONE_COMPLETE;
-  const File fd = my_create(marker.c_str(), 0600, O_WRONLY | O_EXCL,
-                            MYF(MY_WME));
-  if (fd < 0) return clone_io_error();
-  bool failed = my_sync(fd, MYF(MY_WME)) != 0;
-  if (my_close(fd, MYF(MY_WME)) != 0) failed = true;
-  if (failed || !sync_clone_directory(write_dir) ||
+  /* Prepare the stage: received files were synced, persist their directory
+  entries. The live engine stays open until mysqld shuts down. */
+  if (!sync_clone_directory(write_dir) ||
       !sync_clone_directory(clone_parent_dir(write_dir))) {
     remove_clone_stage(write_dir);
     return clone_io_error();
   }
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB clone_apply_end: staging dir %s complete; "
+                  "RocksDB clone_apply_end: staging dir %s prepared; "
                   "install into %s deferred to next startup",
                   write_dir.c_str(), rocksdb_dir.c_str());
   return 0;

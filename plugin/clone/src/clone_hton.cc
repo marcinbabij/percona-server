@@ -29,6 +29,7 @@ Clone Plugin: Interface with SE handlerton
 
 #include "plugin/clone/include/clone_hton.h"
 #include "scope_guard.h"
+#include "sql/clone_handler.h"
 #include "sql/sql_base.h"
 #include "sql/sql_class.h"
 
@@ -336,6 +337,11 @@ int hton_clone_apply_begin(THD *thd, const char *clone_data_dir,
     return clone_args.m_err;
   }
 
+  /* A commit left by an earlier clone must not commit this one. */
+  if (clone_mode == HA_CLONE_MODE_START &&
+      Clone_handler::set_ready_to_apply(clone_data_dir, false, MYF(MY_WME)))
+    return thd->get_stmt_da()->mysql_errno();
+
   uint32_t loop_index [[maybe_unused]] = 0;
 
   const auto original_locators = clone_loc_vec;
@@ -400,22 +406,20 @@ int hton_clone_apply_error(THD *thd, Storage_Vector &clone_loc_vec,
 int hton_clone_apply_end(THD *thd, Storage_Vector &clone_loc_vec,
                          Task_Vector &task_vec, int in_err) {
   int first_error = 0;
-  /* Blocking engines publish their completed checkpoint only after the
-  other engines finish. Any earlier failure must reach their cleanup. */
   assert(task_vec.empty() || task_vec.size() == clone_loc_vec.size());
-  for (int blocking_pass = 0; blocking_pass != 2; ++blocking_pass) {
-    for (size_t index = 0; index < clone_loc_vec.size(); ++index) {
-      const auto &loc = clone_loc_vec[index];
-      Ha_clone_flagset flags;
-      loc.m_hton->clone_interface.clone_capability(flags);
-      const bool blocking = flags[HA_CLONE_BLOCKING] && !flags[HA_CLONE_HYBRID];
-      if (blocking != (blocking_pass != 0)) continue;
-      const uint task = task_vec.empty() ? 0 : task_vec[index];
-      const int err = loc.m_hton->clone_interface.clone_apply_end(
-          loc.m_hton, thd, loc.m_loc, loc.m_loc_len, task, in_err);
-      if (err != 0 && first_error == 0) first_error = err;
-      if (in_err == 0) in_err = err;
-    }
+  for (size_t index = 0; index < clone_loc_vec.size(); ++index) {
+    const auto &loc = clone_loc_vec[index];
+    const uint task = task_vec.empty() ? 0 : task_vec[index];
+    const int err = loc.m_hton->clone_interface.clone_apply_end(
+        loc.m_hton, thd, loc.m_loc, loc.m_loc_len, task, in_err);
+    if (err != 0 && first_error == 0) first_error = err;
+    if (in_err == 0) in_err = err;
   }
   return first_error;
+}
+
+int hton_clone_apply_commit(THD *thd, const char *clone_data_dir) {
+  if (Clone_handler::set_ready_to_apply(clone_data_dir, true, MYF(MY_WME)))
+    return thd->get_stmt_da()->mysql_errno();
+  return 0;
 }

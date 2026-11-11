@@ -166,7 +166,10 @@ static void create_status_file(const Clone_Handle *clone) {
   create_file(file_name);
 }
 
-/** Drop clone in progress file and error file.
+/** Prepare a clone applied without error. The error file of a replace clone
+and the in progress file of a clone into a new data directory are kept: the
+clone plugin commits all engines at once, see
+Clone_handler::READY_TO_APPLY_FILE, and startup checks for that commit.
 @param[in]      clone   clone handle */
 static void drop_status_file(const Clone_Handle *clone) {
   const char *path = clone->get_datadir();
@@ -176,10 +179,6 @@ static void drop_status_file(const Clone_Handle *clone) {
     /* Indicate that clone needs table fix up on recovery. */
     file_name.assign(CLONE_INNODB_FIXUP_FILE);
     create_file(file_name);
-
-    /* drop error file on success. */
-    file_name.assign(CLONE_INNODB_ERROR_FILE);
-    remove_file(file_name);
 
     DBUG_EXECUTE_IF("clone_recovery_crash_point", {
       file_name.assign(CLONE_INNODB_RECOVERY_CRASH_POINT);
@@ -203,11 +202,6 @@ static void drop_status_file(const Clone_Handle *clone) {
   file_name.assign(path_name);
   file_name.append(CLONE_INNODB_REPLACED_FILES);
   create_file(file_name);
-
-  /* Mark successful clone operation. */
-  file_name.assign(path_name);
-  file_name.append(CLONE_INNODB_IN_PROGRESS_FILE);
-  remove_file(file_name);
 }
 
 void clone_init_list_files() {
@@ -690,7 +684,8 @@ int innodb_clone_end(handlerton *, THD *thd, const byte *loc, uint loc_len,
         << ((in_err == 0 || da == nullptr || !da->is_error())
                 ? ""
                 : da->message_text());
-    return (0);
+    /* An apply abandoned here, also after KILL, must not be committed. */
+    return (is_copy ? 0 : in_err);
   }
 
   ut_ad(clone_hdl->is_copy_clone());
@@ -931,6 +926,11 @@ int innodb_clone_apply_begin(handlerton *, THD *thd, const byte *&loc,
 
     /* Set all clone status files empty. */
     if (clone_hdl->replace_datadir()) {
+      /* Roll back a clone which applied but was not committed, e.g. after
+      another engine failed. Its file lists are needed for that. */
+      if (file_exists(CLONE_INNODB_ERROR_FILE)) {
+        clone_files_error();
+      }
       clone_init_list_files();
     }
   }
@@ -1295,6 +1295,8 @@ static void clone_files_fatal_error() {
     }
     new_file.close();
   }
+  /* Withdraw the commit before other engines can install the clone. */
+  std::remove(Clone_handler::READY_TO_APPLY_FILE);
   /* In case of fatal error, from ib::fatal and ut_a asserts
   we terminate the process here and send the exit status so that a
   managed server can be restarted with older data files. */
@@ -1506,6 +1508,14 @@ void clone_files_error() {
     create_file(err_file);
   }
 
+  /* Old files are listed until recovery of a replace clone finished. Rolling
+  them back abandons the clone: withdraw its commit for all engines. */
+  if (file_exists(CLONE_INNODB_OLD_FILES) &&
+      Clone_handler::set_ready_to_apply(nullptr, false, MYF(0))) {
+    ib::error(ER_IB_CLONE_STATUS_FILE)
+        << "Error removing file : " << Clone_handler::READY_TO_APPLY_FILE;
+  }
+
   /* Process all old files to be moved. */
   Clone_file_handler cbk = old_file_rollback;
   process_remove_file(CLONE_INNODB_OLD_FILES, cbk);
@@ -1550,8 +1560,13 @@ void clone_files_recovery(bool finished) {
 
   if (file_exists(file_name)) {
     ut_ad(!finished);
-    clone_files_error();
-    return;
+    /* The error file guards a replace clone until the clone plugin commits
+    it, or until its recovery fails. */
+    if (!Clone_handler::ready_to_apply()) {
+      clone_files_error();
+      return;
+    }
+    remove_file(file_name);
   }
 
   /* if replace file is not present, remove old file. */
@@ -1630,7 +1645,10 @@ void clone_files_recovery(bool finished) {
 dberr_t clone_init() {
   /* Check if incomplete cloned data directory */
   if (os_file_exists(CLONE_INNODB_IN_PROGRESS_FILE)) {
-    return (DB_ABORT_INCOMPLETE_CLONE);
+    if (!Clone_handler::ready_to_apply()) {
+      return (DB_ABORT_INCOMPLETE_CLONE);
+    }
+    remove_file(CLONE_INNODB_IN_PROGRESS_FILE);
   }
 
   /* Initialize clone files before starting recovery. */

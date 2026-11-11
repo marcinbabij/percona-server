@@ -184,7 +184,9 @@ int hton_clone_end(THD *thd, Storage_Vector &clone_loc_vec,
 @param[out]	task_vec		vector of task identifiers
 @param[in]	clone_mode		clone begin mode
 @return error code. On failure, except in HA_CLONE_MODE_RESTART, engines
-begun by this call are ended and both vectors are restored to their input. */
+begun by this call are ended and both vectors are restored to their input.
+HA_CLONE_MODE_START first withdraws the commit of any earlier clone into
+clone_data_dir, see hton_clone_apply_commit(). */
 int hton_clone_apply_begin(THD *thd, const char *clone_data_dir,
                            Storage_Vector &clone_loc_vec, Task_Vector &task_vec,
                            Ha_clone_mode clone_mode);
@@ -203,9 +205,21 @@ int hton_clone_apply_error(THD *thd, Storage_Vector &clone_loc_vec,
 @param[in]	clone_loc_vec	vector of locators for SEs
 @param[in]	task_vec	vector of task identifiers
 @param[in]	in_err		error code when ending after error
-@return first error returned by an engine. Non-blocking engines are ended
-first, then blocking engines, each with the first error seen so far. */
+@return first error returned by an engine. Every engine is ended; after a
+failure the remaining engines are ended with that error. Success only means
+that every engine prepared its data, see hton_clone_apply_commit(). */
 int hton_clone_apply_end(THD *thd, Storage_Vector &clone_loc_vec,
                          Task_Vector &task_vec, int in_err);
+
+/** Commit a clone for all engines at once by creating
+Clone_handler::READY_TO_APPLY_FILE. The master task calls it after
+hton_clone_apply_end() succeeded for every task. Engines install the
+prepared data at the next startup on the cloned data directory, and discard
+it there if the clone was not committed.
+@param[in,out]	thd		server thread handle
+@param[in]	clone_data_dir	target data directory, nullptr to replace the
+				data of this server
+@return error code */
+int hton_clone_apply_commit(THD *thd, const char *clone_data_dir);
 
 #endif /* CLONE_HTON_H */

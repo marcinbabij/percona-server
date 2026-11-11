@@ -983,7 +983,9 @@ enum Ha_clone_mode {
 
 /** Clone operation types. */
 enum Ha_clone_type : size_t {
-  /** Caller must block all write operation to the SE. */
+  /** Caller must block all write operation to the SE. Unless the SE also
+  supports HA_CLONE_HYBRID, the clone plugin blocks writes and commits of
+  all engines on the donor while it copies. */
   HA_CLONE_BLOCKING,
 
   /** For transactional SE, archive redo to support concurrent dml */
@@ -2274,8 +2276,12 @@ using Clone_end_t = int (*)(handlerton *hton, THD *thd, const uchar *loc,
 @param[in,out]  loc_len         locator length
 @param[in]      task_id         task identifier
 @param[in]      mode            mode for starting clone
-@param[in]      data_dir        target data directory
-@return error code */
+@param[in]      data_dir        target data directory, nullptr to replace the
+                                data of this server (provisioning)
+@return error code, also raised in the session
+@note An engine must reject a clone it cannot apply in HA_CLONE_MODE_VERSION.
+In HA_CLONE_MODE_START of a provisioning clone, InnoDB drops the user data of
+all engines, and the engines called after it cannot prevent that anymore. */
 using Clone_apply_begin_t = int (*)(handlerton *hton, THD *thd,
                                     const uchar *&loc, uint &loc_len,
                                     uint &task_id, Ha_clone_mode mode,
@@ -2301,10 +2307,25 @@ using Clone_apply_t = int (*)(handlerton *hton, THD *thd, const uchar *loc,
 @param[in]	loc_len	locator length in bytes
 @param[in]      task_id task identifier
 @param[in]      in_err  error code when ending after error
-@return error code */
+@return error code, also raised in the session. Non-zero whenever the engine
+abandons the clone, also when it does so for in_err == 0, e.g. after KILL.
+@note When the last task ends without error, the engine only prepares the
+clone: the received data is durable, but must not replace any data until
+the clone plugin commits all engines at once, see
+Clone_handler::READY_TO_APPLY_FILE. On error, the engine discards the data.
+The call order of engines is not defined. */
 using Clone_apply_end_t = int (*)(handlerton *hton, THD *thd, const uchar *loc,
                                   uint loc_len, uint task_id, int in_err);
 
+/** Storage engine part of clone.
+- An engine copies and applies only its own data, and raises in the session
+  every error it returns.
+- The clone plugin coordinates the engines of one clone. It calls them in an
+  unspecified order, passes the first error to the remaining ones, blocks
+  donor writes for HA_CLONE_BLOCKING engines, and commits the applied clone
+  for all engines at once, see Clone_handler::READY_TO_APPLY_FILE.
+- The server restarts after a clone replaced its data. Each engine installs
+  or discards its prepared data during its own initialization. */
 struct Clone_interface_t {
   /* Get clone capabilities of an SE */
   Clone_capability_t clone_capability;

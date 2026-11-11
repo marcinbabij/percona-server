@@ -4,6 +4,7 @@
 #define DISABLE_ERROR_LOGGING
 #include <gtest/gtest.h>
 #include <array>
+#include <filesystem>
 #include "plugin/clone/src/clone_hton.cc"
 
 namespace {
@@ -146,14 +147,29 @@ TEST_F(CloneCoordinator, EndFailureReachesEveryEngine) {
             delivered_errors);
 }
 
-TEST_F(CloneCoordinator, ApplyFinalizesBlockingEngineAfterOtherErrors) {
+TEST_F(CloneCoordinator, ApplyEndFailureReachesEveryLaterEngine) {
   end_errors[1] = ER_INTERNAL_ERROR;
   auto active = locators();
   Task_Vector tasks{10, 11, 12};
   EXPECT_EQ(ER_INTERNAL_ERROR, hton_clone_apply_end(nullptr, active, tasks, 0));
-  EXPECT_EQ((std::vector<int>{1, 2, 0}), ended);
-  EXPECT_EQ((std::vector<int>{0, ER_INTERNAL_ERROR, ER_INTERNAL_ERROR}),
-            delivered_errors);
+  EXPECT_EQ((std::vector<int>{0, 1, 2}), ended);
+  EXPECT_EQ((std::vector<int>{0, 0, ER_INTERNAL_ERROR}), delivered_errors);
+}
+
+TEST_F(CloneCoordinator, StartWithdrawsEarlierCommit) {
+  namespace fs = std::filesystem;
+  char pattern[] = "/tmp/clone-commit-XXXXXX";
+  const std::string dir = mkdtemp(pattern);
+  fs::create_directory(dir + "/#clone");
+  const auto marker = dir + "/" + Clone_handler::READY_TO_APPLY_FILE;
+  EXPECT_EQ(0, hton_clone_apply_commit(nullptr, dir.c_str()));
+  EXPECT_TRUE(fs::exists(marker));
+  auto active = locators();
+  Task_Vector tasks;
+  EXPECT_EQ(0, hton_clone_apply_begin(nullptr, dir.c_str(), active, tasks,
+                                      HA_CLONE_MODE_START));
+  EXPECT_FALSE(fs::exists(marker));
+  fs::remove_all(dir);
 }
 
 TEST_F(CloneCoordinator, ApplyErrorNotifiesEveryEngine) {

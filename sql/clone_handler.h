@@ -29,10 +29,12 @@ Clone handler interface to access clone plugin
 #ifndef CLONE_HANDLER_INCLUDED
 #define CLONE_HANDLER_INCLUDED
 
+#include <fcntl.h>
 #include <atomic>
 #include <string>
 
 #include "my_io.h"
+#include "my_sys.h"
 #include "mysql.h"
 #include "sql/sql_plugin_ref.h"  // plugin_ref
 
@@ -103,6 +105,60 @@ class Clone_handler {
 
   /** @return true, if clone provisioning in progress. */
   static bool is_provisioning() { return (s_provision_in_progress > 0); }
+
+  /** Commit marker of a cloned data directory, relative to it. A clone
+  spans several storage engines and becomes effective only at the next
+  startup on the cloned data directory. Without error, clone_apply_end()
+  only prepares the engine data: durable, but neither in use nor replacing
+  any existing data. The clone plugin creates this file after every engine
+  prepared the clone, and removes it before any engine starts a new one.
+  At startup, an engine installs prepared data only if the file exists, and
+  discards it otherwise. Its creation is the single commit point of all
+  engines, whichever of them fails or crashes before it.
+  An engine which can still abandon an installed clone, as InnoDB does when
+  recovery of the cloned data fails, must remove the file first, before
+  any engine which installs later reads it. */
+  static constexpr const char *READY_TO_APPLY_FILE = "#clone/#status_ready";
+
+  /** @return true if the data directory of this server holds
+  READY_TO_APPLY_FILE */
+  static bool ready_to_apply() {
+    return my_access(READY_TO_APPLY_FILE, F_OK) == 0;
+  }
+
+  /** Durably create or remove READY_TO_APPLY_FILE. Its directory must exist.
+  @param[in]  data_dir  cloned data directory, or nullptr for the data
+                        directory of this server
+  @param[in]  ready     true to commit the clone, false to withdraw it
+  @param[in]  flags     MY_WME to raise errors in the session
+  @return true on failure */
+  static bool set_ready_to_apply(const char *data_dir, bool ready,
+                                 myf flags) {
+    const std::string file = data_dir == nullptr
+                                 ? std::string(READY_TO_APPLY_FILE)
+                                 : std::string(data_dir) + "/" +
+                                       READY_TO_APPLY_FILE;
+    if (ready) {
+      const File fd = my_create(file.c_str(), 0, O_WRONLY, flags);
+      if (fd < 0) return true;
+      const bool failed = my_sync(fd, flags) != 0;
+      if (my_close(fd, flags) != 0 || failed) return true;
+    } else if (my_access(file.c_str(), F_OK) != 0) {
+      return false;
+    } else if (my_delete(file.c_str(), flags) != 0) {
+      return true;
+    }
+#ifndef _WIN32
+    /* The directory entry is the commit record: persist it. */
+    const auto dir = file.substr(0, file.rfind('/'));
+    const File fd = my_open(dir.c_str(), O_RDONLY, flags);
+    if (fd < 0) return true;
+    const bool failed = my_sync(fd, flags) != 0;
+    return my_close(fd, flags) != 0 || failed;
+#else
+    return false;
+#endif
+  }
 
   /** @return true, if ordered commit should be forced. Currently
   clone would force ordered commit at end while blocking XA operations */

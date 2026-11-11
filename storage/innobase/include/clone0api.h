@@ -138,7 +138,9 @@ int clone_add_to_list_file(const char *list_file_name, const char *file_name);
 @param[in]      file_name       list file name to delete */
 void clone_remove_list_file(const char *file_name);
 
-/** Revert back clone changes in case of an error. */
+/** Revert back clone changes in case of an error. Reverting a replace clone
+which did not finish recovery also withdraws its commit, see
+Clone_handler::READY_TO_APPLY_FILE, so that no other engine installs it. */
 void clone_files_error();
 
 #ifdef UNIV_DEBUG
@@ -147,7 +149,9 @@ void clone_files_error();
 bool clone_check_recovery_crashpoint(bool is_cloned_db);
 #endif
 
-/** Change cloned file states during recovery.
+/** Change cloned file states during recovery. A replace clone is installed
+only if the clone plugin committed it, see Clone_handler::READY_TO_APPLY_FILE,
+and is rolled back otherwise.
 @param[in]      finished        if recovery is finishing */
 void clone_files_recovery(bool finished);
 
@@ -155,7 +159,8 @@ void clone_files_recovery(bool finished);
 @param[in]      gtids   cloned GTIDs */
 void clone_update_gtid_status(std::string &gtids);
 
-/** Initialize Clone system
+/** Initialize Clone system. A data directory cloned into a new location
+opens only if the clone plugin committed the clone.
 @return inndodb error code */
 dberr_t clone_init();
 

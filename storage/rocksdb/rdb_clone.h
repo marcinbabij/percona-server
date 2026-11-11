@@ -26,7 +26,7 @@ void rdb_clone_init();
 /** Outcome of the startup check for a pending provisioning clone. */
 enum class Rdb_clone_recovery {
   /** rocksdb_dir holds the database to open: no clone was pending, an
-  incomplete receive was discarded, or the saved database was restored. */
+  uncommitted receive was discarded, or the saved database was restored. */
   NONE,
   /** rocksdb_dir holds a received database and <rocksdb_dir>_clone_old may
   hold the previous one until rdb_clone_finish_pending() removes it. */
@@ -36,9 +36,10 @@ enum class Rdb_clone_recovery {
   ERROR
 };
 
-/** Resume a completed provisioning clone, preserving the old database.
-Call before discovering or opening any files in rocksdb_dir. ERROR means
-startup must stop; NONE also covers discarding an incomplete receive.
+/** Install a provisioning clone committed by the clone plugin, preserving
+the old database, or discard an uncommitted one, see
+Clone_handler::READY_TO_APPLY_FILE. Call before discovering or opening any
+files in rocksdb_dir. ERROR means startup must stop.
 @param[in]  rocksdb_dir  configured rocksdb_datadir
 @return recovery outcome, see Rdb_clone_recovery */
 Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir);

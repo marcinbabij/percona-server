@@ -191,6 +191,8 @@ int Local::clone_exec() {
   const auto apply_error =
       hton_clone_apply_end(thd, client_vector, client_tasks, error);
   if (error == 0) error = apply_error;
+  /* Workers have ended: the master commits all engines and tasks. */
+  if (error == 0 && is_master) error = hton_clone_apply_commit(thd, dir_name);
 
   /* End clone copy from source. */
   const auto end_error = hton_clone_end(thd, server_vector, server_tasks, error);

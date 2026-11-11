@@ -863,6 +863,9 @@ int Client::clone() {
     const auto end_error =
         hton_clone_apply_end(m_server_thd, m_share->m_storage_vec, m_tasks, err);
     if (err == 0) err = end_error;
+    /* Workers have ended: the master commits all engines and tasks. */
+    if (err == 0 && is_master())
+      err = hton_clone_apply_commit(m_server_thd, get_data_dir());
 
     m_storage_initialized = false;
     m_storage_active = false;
