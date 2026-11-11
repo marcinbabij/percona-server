@@ -145,6 +145,14 @@ TEST_F(CloneContract, LeftoverBackupWarnsAndBlocksProvisioning) {
       length, task, 0));
 }
 
+TEST_F(CloneContract, InitRemovesStaleCheckpointsOfThisDatadirOnly) {
+  create_database(myrocks::test_datadir + "_clone_ckpt_7");
+  create_database(root + "/other_clone_ckpt_7");
+  myrocks::rdb_clone_init();
+  EXPECT_FALSE(fs::exists(myrocks::test_datadir + "_clone_ckpt_7"));
+  EXPECT_TRUE(fs::exists(root + "/other_clone_ckpt_7/CURRENT"));
+}
+
 TEST_F(CloneContract, MissingStageRestoresSavedDatabase) {
   const auto live = myrocks::test_datadir;
   create_database(live + "_clone_old");

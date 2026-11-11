@@ -118,8 +118,8 @@ struct Rdb_clone_tasks {
 
 /** Donor-side clone session: holds the checkpoint directory and file list. */
 struct Rdb_clone_session : Rdb_clone_tasks {
-  /** Checkpoint directory, a sibling of rocksdb_datadir, destroyed by the
-  last end call */
+  /** Checkpoint directory, a sibling of rocksdb_datadir named by
+  RDB_CLONE_CHECKPOINT, destroyed by the last end call */
   std::string checkpoint_dir;
   /** Checkpoint files, sent in this order by the master task */
   std::vector<Rdb_clone_file_info> files;
@@ -200,10 +200,6 @@ static std::unordered_map<uint32_t, Rdb_clone_session> g_clone_sessions;
 /** Recipient sessions by donor session identifier */
 static std::unordered_map<uint32_t, Rdb_clone_apply_session> g_apply_sessions;
 
-void rdb_clone_init() {
-  /* g_clone_mutex and atomics self-initialize; nothing else needed here. */
-}
-
 void rdb_clone_destroy() {
   std::lock_guard<std::mutex> guard(g_clone_mutex);
   for (auto &kv : g_clone_sessions) {
@@ -248,6 +244,33 @@ static std::string clone_live_dir(const char *dir) {
   std::string path(dir);
   while (path.size() > 1 && path.back() == '/') path.pop_back();
   return path;
+}
+
+/** Suffix of rocksdb_datadir naming a donor checkpoint, followed by the
+session identifier. */
+static constexpr const char *RDB_CLONE_CHECKPOINT = "_clone_ckpt_";
+
+void rdb_clone_init() {
+  /* A donor crash leaves its checkpoint behind. It keeps old files allocated
+  through hard links, and would make the next clone fail, as session
+  identifiers restart from 1. No session exists yet, so any checkpoint of
+  this rocksdb_datadir is stale. */
+  const auto prefix =
+      clone_live_dir(rdb_get_rocksdb_datadir()) + RDB_CLONE_CHECKPOINT;
+  const auto slash = prefix.rfind('/');
+  const auto parent = prefix.substr(0, slash + 1);
+  const auto name_prefix = prefix.substr(slash + 1);
+  MY_DIR *dir = my_dir(parent.empty() ? "." : parent.c_str(), MYF(0));
+  if (dir == nullptr) return;
+  for (uint i = 0; i < dir->number_off_files; i++) {
+    const std::string name = dir->dir_entry[i].name;
+    if (name.compare(0, name_prefix.size(), name_prefix) != 0) continue;
+    LogPluginErrMsg(WARNING_LEVEL, 0,
+                    "RocksDB clone: removing stale checkpoint %s%s",
+                    parent.c_str(), name.c_str());
+    rocksdb::DestroyDB(parent + name, rocksdb::Options());
+  }
+  my_dirend(dir);
 }
 
 /* Installation is a sequence of two durable renames, each of them atomic:
@@ -471,12 +494,9 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
 
   /* Place the checkpoint as a sibling of rocksdb_datadir so that RocksDB
      can hard-link SST files (same filesystem, no data copying needed). */
-  const std::string base = clone_live_dir(rdb_get_rocksdb_datadir());
-  const auto sep = base.rfind('/');
-  const std::string parent =
-      (sep != std::string::npos) ? base.substr(0, sep) : ".";
   const std::string checkpoint_dir =
-      parent + "/.rocksdb_clone_" + std::to_string(session_id);
+      clone_live_dir(rdb_get_rocksdb_datadir()) + RDB_CLONE_CHECKPOINT +
+      std::to_string(session_id);
 
   rocksdb::Checkpoint *ckpt = nullptr;
   auto status = rocksdb::Checkpoint::Create(rdb_get_rocksdb_db(), &ckpt);
