@@ -45,9 +45,10 @@ files in rocksdb_dir. ERROR means startup must stop.
 Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir);
 
 /** Remove the saved database only after the received engine initialized.
-@param[in]  rocksdb_dir  configured rocksdb_datadir
-@return zero on success, or a MySQL error code on persistence failure */
-int rdb_clone_finish_pending(const char *rocksdb_dir);
+A failure is logged as a warning: the server runs, and the removal is
+retried at the next startup. Provisioning clones are rejected until then.
+@param[in]  rocksdb_dir  configured rocksdb_datadir */
+void rdb_clone_finish_pending(const char *rocksdb_dir);
 
 /** Destroy the clone module: drop all sessions and their donor
 checkpoints. Call once from rocksdb_shutdown(). */

@@ -96,7 +96,7 @@ TEST_F(CloneContract, RestartBetweenRenamesMustPreserveOldDatabase) {
   EXPECT_TRUE(fs::exists(live + "_clone_old/CURRENT"));
   EXPECT_EQ(myrocks::Rdb_clone_recovery::INSTALLED,
             myrocks::rdb_clone_apply_pending(live.c_str()));
-  EXPECT_EQ(0, myrocks::rdb_clone_finish_pending(live.c_str()));
+  myrocks::rdb_clone_finish_pending(live.c_str());
   EXPECT_FALSE(fs::exists(live + "_clone_old"));
   EXPECT_TRUE(fs::exists(live + "/CURRENT"));
 }
@@ -115,8 +115,34 @@ TEST_F(CloneContract, PreparedStageInstallsOnlyAfterCommit) {
             myrocks::rdb_clone_apply_pending(live.c_str()));
   EXPECT_FALSE(fs::exists(live + "_clone_recv"));
   EXPECT_TRUE(fs::exists(live + "_clone_old/CURRENT"));
-  EXPECT_EQ(0, myrocks::rdb_clone_finish_pending(live.c_str()));
+  myrocks::rdb_clone_finish_pending(live.c_str());
   EXPECT_FALSE(fs::exists(live + "_clone_old"));
+}
+
+TEST_F(CloneContract, LeftoverBackupWarnsAndBlocksProvisioning) {
+  const auto live = myrocks::test_datadir;
+  create_database(live);
+  create_database(live + "_clone_old");
+  // DestroyDB() keeps a directory holding files RocksDB did not create.
+  fs::create_directory(live + "_clone_old/trace");
+  commit();
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::INSTALLED,
+            myrocks::rdb_clone_apply_pending(live.c_str()));
+  myrocks::rdb_clone_finish_pending(live.c_str());
+  EXPECT_TRUE(fs::exists(live + "_clone_old/trace"));
+  fs::remove(Clone_handler::READY_TO_APPLY_FILE);
+  EXPECT_EQ(myrocks::Rdb_clone_recovery::NONE,
+            myrocks::rdb_clone_apply_pending(live.c_str()));
+  EXPECT_TRUE(fs::exists(live + "/CURRENT"));
+  uint length = 0, task = 0;
+  const uchar *locator = nullptr;
+  EXPECT_EQ(ER_FILE_EXISTS_ERROR, myrocks::rocksdb_clone_apply_begin(nullptr,
+      nullptr, locator, length, task, HA_CLONE_MODE_VERSION, nullptr));
+  fs::remove_all(live + "_clone_old");
+  ASSERT_EQ(0, myrocks::rocksdb_clone_apply_begin(nullptr, nullptr, locator,
+      length, task, HA_CLONE_MODE_VERSION, nullptr));
+  EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator,
+      length, task, 0));
 }
 
 TEST_F(CloneContract, MissingStageRestoresSavedDatabase) {

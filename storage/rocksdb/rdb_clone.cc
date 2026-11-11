@@ -264,8 +264,8 @@ static std::string clone_live_dir(const char *dir) {
      B  L  M : both renames done      -> INSTALLED, finish removes B
      S  !M   : clone not committed    -> stage discarded
      B  !L   : stage lost             -> B restored
-   Any other combination with B present cannot be explained by this
-   sequence and is rejected. */
+     B  L !M : leftover backup        -> warning, server starts
+   S B L and S B !M cannot be explained by this sequence and are rejected. */
 Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
   if (rocksdb_dir == nullptr) return Rdb_clone_recovery::NONE;
   const std::string live_dir = clone_live_dir(rocksdb_dir);
@@ -287,11 +287,11 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
     }
     /* Installation finished, but engine recovery or backup cleanup did not. */
     if (committed) return Rdb_clone_recovery::INSTALLED;
-    LogPluginErrMsg(ERROR_LEVEL, 0,
-                    "RocksDB clone: both %s and %s exist without a committed "
-                    "clone; remove the one which is not needed",
-                    live_dir.c_str(), backup_dir.c_str());
-    return Rdb_clone_recovery::ERROR;
+    LogPluginErrMsg(WARNING_LEVEL, 0,
+                    "RocksDB clone: %s is left from an installed clone; "
+                    "remove it to allow provisioning clones again",
+                    backup_dir.c_str());
+    return Rdb_clone_recovery::NONE;
   }
 
   if (!committed) {
@@ -332,20 +332,26 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
   return Rdb_clone_recovery::INSTALLED;
 }
 
-int rdb_clone_finish_pending(const char *rocksdb_dir) {
+void rdb_clone_finish_pending(const char *rocksdb_dir) {
   const std::string live_dir = clone_live_dir(rocksdb_dir);
   const std::string backup_dir = live_dir + "_clone_old";
   if (!clone_directory_exists(backup_dir) || !Clone_handler::ready_to_apply())
-    return 0;
+    return;
+  /* DestroyDB() keeps the directory if it holds files RocksDB did not
+  create. The received database is in use already: only warn, and retry at
+  the next startup. Provisioning is rejected meanwhile, see
+  rocksdb_clone_apply_begin(). */
   const auto status = rocksdb::DestroyDB(backup_dir, rocksdb::Options());
-  if (!status.ok() || !sync_clone_directory(clone_parent_dir(live_dir))) {
-    LogPluginErrMsg(ERROR_LEVEL, 0, "RocksDB clone: cannot remove %s: %s",
+  if (!status.ok() || clone_directory_exists(backup_dir) ||
+      !sync_clone_directory(clone_parent_dir(live_dir))) {
+    LogPluginErrMsg(WARNING_LEVEL, 0,
+                    "RocksDB clone: cannot remove %s: %s; remove it to "
+                    "allow provisioning clones again",
                     backup_dir.c_str(), status.ToString().c_str());
-    return clone_io_error();
+    return;
   }
   LogPluginErrMsg(INFORMATION_LEVEL, 0, "RocksDB clone: installed %s",
                   live_dir.c_str());
-  return 0;
 }
 
 /* ---- Internal helpers ---- */
@@ -650,8 +656,18 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
     return HA_ERR_UNSUPPORTED;
   }
 
-  /* Version negotiation only — data_dir is null at this stage. */
+  /* Version negotiation only. A provisioning clone must be rejected here,
+  before InnoDB drops all user data in HA_CLONE_MODE_START. The backup of
+  an earlier clone would block the installation at the next startup. */
   if (mode == HA_CLONE_MODE_VERSION) {
+    const char *live_dir = rdb_get_rocksdb_datadir();
+    if (data_dir == nullptr && live_dir != nullptr) {
+      const auto backup_dir = clone_live_dir(live_dir) + "_clone_old";
+      if (clone_directory_exists(backup_dir)) {
+        my_error(ER_FILE_EXISTS_ERROR, MYF(0), backup_dir.c_str());
+        return ER_FILE_EXISTS_ERROR;
+      }
+    }
     task_id = 0;
     loc = alloc_locator(0, loc_len);
     return 0;
