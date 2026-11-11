@@ -231,6 +231,18 @@ static bool clone_rename_directory(const std::string &from,
   return true;
 }
 
+/** Get rocksdb_datadir without trailing '/'. The clone directories are named
+by appending a suffix, and must be siblings of the live directory: with a
+trailing '/' they would be created inside it, and the startup rename of the
+live directory into its own child would fail.
+@param[in]  dir  configured rocksdb_datadir
+@return directory path without trailing separators, "/" for the root */
+static std::string clone_live_dir(const char *dir) {
+  std::string path(dir);
+  while (path.size() > 1 && path.back() == '/') path.pop_back();
+  return path;
+}
+
 /* Installation is a sequence of two durable renames, each of them atomic:
      live -> live_clone_old (skipped if there is no live directory),
      live_clone_recv -> live.
@@ -247,7 +259,7 @@ static bool clone_rename_directory(const std::string &from,
    and is rejected, except a lone B, which is restored. */
 Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
   if (rocksdb_dir == nullptr) return Rdb_clone_recovery::NONE;
-  const std::string live_dir(rocksdb_dir);
+  const std::string live_dir = clone_live_dir(rocksdb_dir);
   const std::string staging_dir = live_dir + "_clone_recv";
   const std::string backup_dir = live_dir + "_clone_old";
   const bool have_live = clone_directory_exists(live_dir);
@@ -310,7 +322,7 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
 }
 
 int rdb_clone_finish_pending(const char *rocksdb_dir) {
-  const std::string live_dir(rocksdb_dir);
+  const std::string live_dir = clone_live_dir(rocksdb_dir);
   if (!clone_is_complete(live_dir)) return 0;
   const std::string backup_dir = live_dir + "_clone_old";
   if (clone_directory_exists(backup_dir)) {
@@ -439,8 +451,7 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
 
   /* Place the checkpoint as a sibling of rocksdb_datadir so that RocksDB
      can hard-link SST files (same filesystem, no data copying needed). */
-  std::string base(rdb_get_rocksdb_datadir());
-  while (!base.empty() && base.back() == '/') base.pop_back();
+  const std::string base = clone_live_dir(rdb_get_rocksdb_datadir());
   const auto sep = base.rfind('/');
   const std::string parent =
       (sep != std::string::npos) ? base.substr(0, sep) : ".";
@@ -688,7 +699,7 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
                "RocksDB datadir not available for clone");
       return HA_EXIT_FAILURE;
     }
-    rocksdb_dir = std::string(live_dir);
+    rocksdb_dir = clone_live_dir(live_dir);
   }
 
   /* In provisioning mode the live RocksDB is running, so writing donor files
