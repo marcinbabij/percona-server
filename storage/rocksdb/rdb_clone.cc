@@ -16,6 +16,7 @@
 #include "./rdb_clone.h"
 
 /* C++ standard headers */
+#include <cassert>
 #include <atomic>
 #include <algorithm>
 #include <mutex>
@@ -131,8 +132,6 @@ In provisioning mode (data_dir==nullptr), files are staged in write_dir
 next startup installs it if the clone plugin committed the clone, see
 Clone_handler::READY_TO_APPLY_FILE. */
 struct Rdb_clone_apply_session : Rdb_clone_tasks {
-  /** Final destination */
-  std::string rocksdb_dir;
   /** Where files are written during apply */
   std::string write_dir;
   /** True when data_dir was nullptr */
@@ -155,6 +154,14 @@ struct Rdb_clone_apply_session : Rdb_clone_tasks {
   /** Names of all files started, to reject a file sent twice */
   std::unordered_set<std::string> received_names;
 };
+
+/** Suffixes of rocksdb_datadir naming the clone directories next to it:
+the received database until the next startup installs it, the previous
+database until the received one opened, and donor checkpoints, followed by
+the session identifier. */
+static constexpr const char *RDB_CLONE_STAGE = "_clone_recv";
+static constexpr const char *RDB_CLONE_BACKUP = "_clone_old";
+static constexpr const char *RDB_CLONE_CHECKPOINT = "_clone_ckpt_";
 
 /** Get the directory whose entry must be synced to persist a rename or a
 creation of path.
@@ -246,10 +253,6 @@ static std::string clone_live_dir(const char *dir) {
   return path;
 }
 
-/** Suffix of rocksdb_datadir naming a donor checkpoint, followed by the
-session identifier. */
-static constexpr const char *RDB_CLONE_CHECKPOINT = "_clone_ckpt_";
-
 void rdb_clone_init() {
   /* A donor crash leaves its checkpoint behind. It keeps old files allocated
   through hard links, and would make the next clone fail, as session
@@ -290,10 +293,9 @@ void rdb_clone_init() {
      B  L !M : leftover backup        -> warning, server starts
    S B L and S B !M cannot be explained by this sequence and are rejected. */
 Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
-  if (rocksdb_dir == nullptr) return Rdb_clone_recovery::NONE;
   const std::string live_dir = clone_live_dir(rocksdb_dir);
-  const std::string staging_dir = live_dir + "_clone_recv";
-  const std::string backup_dir = live_dir + "_clone_old";
+  const std::string staging_dir = live_dir + RDB_CLONE_STAGE;
+  const std::string backup_dir = live_dir + RDB_CLONE_BACKUP;
   const bool have_live = clone_directory_exists(live_dir);
   const bool have_backup = clone_directory_exists(backup_dir);
   const bool committed = Clone_handler::ready_to_apply();
@@ -357,7 +359,7 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
 
 void rdb_clone_finish_pending(const char *rocksdb_dir) {
   const std::string live_dir = clone_live_dir(rocksdb_dir);
-  const std::string backup_dir = live_dir + "_clone_old";
+  const std::string backup_dir = live_dir + RDB_CLONE_BACKUP;
   if (!clone_directory_exists(backup_dir) || !Clone_handler::ready_to_apply())
     return;
   /* DestroyDB() keeps the directory if it holds files RocksDB did not
@@ -460,10 +462,8 @@ void rocksdb_clone_get_capability(Ha_clone_flagset &flags) {
 
 int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
                         uint &task_id, Ha_clone_type, Ha_clone_mode mode) {
-  if (mode == HA_CLONE_MODE_RESTART) {
-    my_error(ER_NOT_SUPPORTED_YET, MYF(0), "RocksDB clone restart");
-    return HA_ERR_UNSUPPORTED;
-  }
+  /* The clone plugin restarts only engines with HA_CLONE_RESTART. */
+  assert(mode != HA_CLONE_MODE_RESTART);
 
   /* Version negotiation only — return a minimal locator, no checkpoint. */
   if (mode == HA_CLONE_MODE_VERSION) {
@@ -487,8 +487,6 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
   }
 
   /* HA_CLONE_MODE_START: create a RocksDB checkpoint and enumerate files. */
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB clone_begin: starting checkpoint creation");
   const uint32_t session_id = g_next_session_id.fetch_add(1);
   task_id = 0;
 
@@ -500,18 +498,15 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
       clone_live_dir(rdb_get_rocksdb_datadir()) + RDB_CLONE_CHECKPOINT +
       std::to_string(session_id);
 
-  rocksdb::Checkpoint *ckpt = nullptr;
-  auto status = rocksdb::Checkpoint::Create(rdb_get_rocksdb_db(), &ckpt);
-  if (!status.ok()) {
-    my_error(ER_GET_ERRMSG, MYF(0), status.code(),
-             status.ToString().c_str(), "rocksdb");
-    return HA_EXIT_FAILURE;
-  }
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB clone_begin: creating checkpoint at %s",
                   checkpoint_dir.c_str());
-  status = ckpt->CreateCheckpoint(checkpoint_dir.c_str());
-  delete ckpt;
+  rocksdb::Checkpoint *ckpt = nullptr;
+  auto status = rocksdb::Checkpoint::Create(rdb_get_rocksdb_db(), &ckpt);
+  if (status.ok()) {
+    status = ckpt->CreateCheckpoint(checkpoint_dir.c_str());
+    delete ckpt;
+  }
   if (!status.ok()) {
     my_error(ER_GET_ERRMSG, MYF(0), status.code(),
              status.ToString().c_str(), "rocksdb");
@@ -520,11 +515,6 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
 
   Rdb_clone_session session;
   session.checkpoint_dir = checkpoint_dir;
-  uint locator_length = 0;
-  session.locator.reset(alloc_locator(session_id, locator_length));
-  /* Moving the session into the map keeps the locator address. */
-  const uchar *const locator = session.locator.get();
-
   MY_DIR *dir = my_dir(checkpoint_dir.c_str(), MYF(MY_WANT_STAT));
   if (dir == nullptr) {
     rocksdb::DestroyDB(checkpoint_dir, rocksdb::Options());
@@ -535,27 +525,20 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
     const char *name = dir->dir_entry[i].name;
     if (name[0] == '.') continue;
     if (S_ISDIR(dir->dir_entry[i].mystat->st_mode)) continue;
-    Rdb_clone_file_info fi;
-    fi.rel_path = name;
-    fi.file_size =
-        static_cast<uint64_t>(dir->dir_entry[i].mystat->st_size);
-    session.files.push_back(std::move(fi));
+    session.files.push_back(
+        {name, static_cast<uint64_t>(dir->dir_entry[i].mystat->st_size)});
   }
   my_dirend(dir);
-
-  const size_t num_files = session.files.size();
-  {
-    std::lock_guard<std::mutex> guard(g_clone_mutex);
-    g_clone_sessions.emplace(session_id, std::move(session));
-  }
-
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB clone_begin: session %u, %zu files in checkpoint",
-                  session_id, num_files);
-  /* Set the output locator only on success: the session owning it is
-  destroyed on any earlier return. */
-  loc = locator;
-  loc_len = locator_length;
+                  session_id, session.files.size());
+
+  /* No failure is possible from here: set the outputs. The locator keeps
+  its address when the session moves into the map. */
+  session.locator.reset(alloc_locator(session_id, loc_len));
+  loc = session.locator.get();
+  std::lock_guard<std::mutex> guard(g_clone_mutex);
+  g_clone_sessions.emplace(session_id, std::move(session));
   return 0;
 }
 
@@ -673,19 +656,16 @@ int rocksdb_clone_end(handlerton *, THD *, const uchar *loc, uint loc_len,
 int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
                               uint &loc_len, uint &task_id, Ha_clone_mode mode,
                               const char *data_dir) {
-  if (mode == HA_CLONE_MODE_RESTART) {
-    my_error(ER_NOT_SUPPORTED_YET, MYF(0), "RocksDB clone restart");
-    return HA_ERR_UNSUPPORTED;
-  }
+  /* The clone plugin restarts only engines with HA_CLONE_RESTART. */
+  assert(mode != HA_CLONE_MODE_RESTART);
 
   /* Version negotiation only. A provisioning clone must be rejected here,
   before InnoDB drops all user data in HA_CLONE_MODE_START. The backup of
   an earlier clone would block the installation at the next startup. */
   if (mode == HA_CLONE_MODE_VERSION) {
-    const char *live_dir = rdb_get_rocksdb_datadir();
-    if (data_dir == nullptr && live_dir != nullptr) {
-      const auto live = clone_live_dir(live_dir);
-      const auto backup_dir = live + "_clone_old";
+    if (data_dir == nullptr) {
+      const auto live = clone_live_dir(rdb_get_rocksdb_datadir());
+      const auto backup_dir = live + RDB_CLONE_BACKUP;
       if (clone_directory_exists(backup_dir)) {
         my_error(ER_FILE_EXISTS_ERROR, MYF(0), backup_dir.c_str());
         return ER_FILE_EXISTS_ERROR;
@@ -727,65 +707,45 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
     return ER_CLONE_PROTOCOL;
   }
 
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB clone_apply_begin: START mode, data_dir=%s",
-                  (data_dir != nullptr) ? data_dir : "(provisioning)");
-
   const bool is_provisioning = (data_dir == nullptr);
-
-  /* Resolve the final destination directory. */
-  std::string rocksdb_dir;
-  if (!is_provisioning) {
+  std::string write_dir;
+  if (is_provisioning) {
+    /* The live RocksDB is running, so writing donor files directly into its
+    directory risks the compactor deleting our files. Stage into a sibling
+    directory, prepare it in apply_end, and install it during the next
+    startup if the clone plugin committed the clone. A stage left by an
+    earlier clone is not committed anymore: the clone plugin withdrew any
+    commit before this call. */
+    write_dir = clone_live_dir(rdb_get_rocksdb_datadir()) + RDB_CLONE_STAGE;
+    remove_clone_stage(write_dir);
+    if (my_mkdir(write_dir.c_str(), 0750, MYF(0)) != 0 && errno != EEXIST) {
+      my_error(ER_CANT_CREATE_FILE, MYF(0), write_dir.c_str(), errno);
+      return HA_EXIT_FAILURE;
+    }
+  } else {
     std::string relative(rdb_get_rocksdb_datadir());
     while (relative.rfind("./", 0) == 0) relative.erase(0, 2);
     while (!relative.empty() && relative.back() == '/') relative.pop_back();
-    /* An absolute source path cannot be reused inside an isolated clone. */
-    if (relative.empty() || relative.front() == '/') {
-      my_error(ER_NOT_SUPPORTED_YET, MYF(0),
-               "RocksDB DATA DIRECTORY clone with an absolute engine path");
-      return ER_NOT_SUPPORTED_YET;
-    }
-    for (size_t begin = 0; begin < relative.size();) {
+    /* The same path is used inside the clone: it must be relative and stay
+    below the data directory, so no part may be empty, "." or "..". */
+    bool contained = !relative.empty();
+    for (size_t begin = 0; contained;) {
       const auto slash = relative.find('/', begin);
       const auto part = relative.substr(begin, slash - begin);
-      if (part.empty() || part == "." || part == "..") {
-        my_error(ER_NOT_SUPPORTED_YET, MYF(0),
-                 "RocksDB DATA DIRECTORY clone with a non-contained path");
-        return ER_NOT_SUPPORTED_YET;
-      }
+      contained = !part.empty() && part != "." && part != "..";
       if (slash == std::string::npos) break;
       begin = slash + 1;
     }
-    rocksdb_dir = std::string(data_dir) + "/" + relative;
-  } else {
-    const char *live_dir = rdb_get_rocksdb_datadir();
-    if (live_dir == nullptr) {
-      my_error(ER_INTERNAL_ERROR, MYF(0),
-               "RocksDB datadir not available for clone");
-      return HA_EXIT_FAILURE;
+    if (!contained) {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+               "RocksDB DATA DIRECTORY clone with rocksdb_datadir outside "
+               "the data directory");
+      return ER_NOT_SUPPORTED_YET;
     }
-    rocksdb_dir = clone_live_dir(live_dir);
-  }
-
-  /* In provisioning mode the live RocksDB is running, so writing donor files
-     directly into its directory risks the compactor deleting our files.
-     Stage into a sibling directory, prepare it in apply_end, and install
-     it during the next startup if the clone plugin committed the clone. */
-  const std::string write_dir =
-      is_provisioning ? rocksdb_dir + "_clone_recv" : rocksdb_dir;
-
-  /* Remove a stage left by an earlier clone. It is not committed anymore:
-  the clone plugin withdrew any commit before this call. */
-  if (is_provisioning) remove_clone_stage(write_dir);
-
-  if (is_provisioning &&
-      my_mkdir(write_dir.c_str(), 0750, MYF(0)) != 0 && errno != EEXIST) {
-    my_error(ER_CANT_CREATE_FILE, MYF(0), write_dir.c_str(), errno);
-    return HA_EXIT_FAILURE;
+    write_dir = std::string(data_dir) + "/" + relative;
   }
 
   Rdb_clone_apply_session session;
-  session.rocksdb_dir = rocksdb_dir;
   session.write_dir = write_dir;
   session.is_provisioning = is_provisioning;
   if (!is_provisioning) session.local_root = data_dir;
@@ -928,65 +888,48 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
   first, and a new provisioning receive started meanwhile would otherwise
   remove the same stage directory in its apply_begin. */
   std::lock_guard<std::mutex> guard(g_clone_mutex);
-  std::string rocksdb_dir;
-  std::string write_dir;
-  bool is_provisioning = false;
-  const int input_error = in_err;
 
-  /* After an earlier error, only cleanup matters: do not report another. */
+  /* After an earlier error, only cleanup matters: do not raise another. */
   if (!validate_locator(loc, loc_len))
-    return input_error == 0 ? clone_protocol_error(RDB_CLONE_BAD_LOCATOR) : 0;
+    return in_err != 0 ? in_err : clone_protocol_error(RDB_CLONE_BAD_LOCATOR);
   const uint32_t sid = locator_session_id(loc);
   if (sid == 0) {
     delete[] loc;
-    return 0;
+    return in_err;
   }
-  {
-    const auto it = g_apply_sessions.find(sid);
-    if (it == g_apply_sessions.end())
-      return input_error == 0 ? clone_protocol_error(RDB_CLONE_NO_SESSION) : 0;
-    if (it->second.active.erase(task_id) != 1)
-      return clone_protocol_error(RDB_CLONE_NO_TASK);
-    if (in_err != 0) it->second.error = in_err;
-    if (!it->second.active.empty()) return 0;
-    in_err = it->second.error;
-    if (in_err == 0 && (it->second.file_count == 0 ||
-                       it->second.next_file != it->second.file_count))
-      in_err = clone_protocol_error("RocksDB clone ended before all files");
-    rocksdb_dir = it->second.rocksdb_dir;
-    write_dir = it->second.write_dir;
-    is_provisioning = it->second.is_provisioning;
-    g_apply_sessions.erase(it);
-  }
+  const auto it = g_apply_sessions.find(sid);
+  if (it == g_apply_sessions.end())
+    return in_err != 0 ? in_err : clone_protocol_error(RDB_CLONE_NO_SESSION);
+  if (it->second.active.erase(task_id) != 1)
+    return clone_protocol_error(RDB_CLONE_NO_TASK);
+  if (in_err != 0) it->second.error = in_err;
+  if (!it->second.active.empty()) return in_err;
+  const auto session = std::move(it->second);
+  g_apply_sessions.erase(it);
 
-  if (!is_provisioning) {
-    if (in_err == 0 && !write_dir.empty() &&
-        (!sync_clone_directory(write_dir) ||
-         !sync_clone_directory(clone_parent_dir(write_dir))))
-      return clone_io_error();
-    return input_error == 0 ? in_err : 0;
-  }
+  int err = session.error;
+  if (err == 0 &&
+      (session.file_count == 0 || session.next_file != session.file_count))
+    err = clone_protocol_error("RocksDB clone ended before all files");
+  /* Received files were synced, persist their directory entries. */
+  if (err == 0 && (!sync_clone_directory(session.write_dir) ||
+                   !sync_clone_directory(clone_parent_dir(session.write_dir))))
+    err = clone_io_error();
+  if (!session.is_provisioning) return err;
 
-  if (in_err != 0) {
-    /* Clone failed — remove the incomplete staging directory. */
+  if (err != 0) {
     LogPluginErrMsg(INFORMATION_LEVEL, 0,
                     "RocksDB clone_apply_end: clone error %d, "
-                    "removing staging dir %s", in_err, write_dir.c_str());
-    remove_clone_stage(write_dir);
-    return input_error == 0 ? in_err : 0;
+                    "removing staging dir %s",
+                    err, session.write_dir.c_str());
+    remove_clone_stage(session.write_dir);
+    return err;
   }
-
-  /* Prepare the stage: received files were synced, persist their directory
-  entries. The live engine stays open until mysqld shuts down. */
-  if (!sync_clone_directory(write_dir) ||
-      !sync_clone_directory(clone_parent_dir(write_dir))) {
-    remove_clone_stage(write_dir);
-    return clone_io_error();
-  }
+  /* The live engine stays open until mysqld shuts down. */
   LogPluginErrMsg(INFORMATION_LEVEL, 0,
                   "RocksDB clone_apply_end: staging dir %s prepared; "
-                  "install into %s deferred to next startup",
-                  write_dir.c_str(), rocksdb_dir.c_str());
+                  "install deferred to next startup",
+                  session.write_dir.c_str());
   return 0;
 }
 

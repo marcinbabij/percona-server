@@ -187,8 +187,8 @@ TEST_F(CloneContract, ApplyWorkersShareStageAndKeepItUntilLastEnd) {
   EXPECT_NE(master_task, worker_task);
   EXPECT_EQ(donor.get(), worker);
   EXPECT_TRUE(fs::exists(stage + "/CURRENT"));
-  EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, master,
-      length, master_task, ER_QUERY_INTERRUPTED));
+  EXPECT_EQ(ER_QUERY_INTERRUPTED, myrocks::rocksdb_clone_apply_end(nullptr,
+      nullptr, master, length, master_task, ER_QUERY_INTERRUPTED));
   EXPECT_TRUE(fs::exists(stage));
   EXPECT_EQ(ER_QUERY_INTERRUPTED, myrocks::rocksdb_clone_apply_end(nullptr,
       nullptr, worker, length, worker_task, 0));
@@ -209,8 +209,8 @@ TEST_F(CloneContract, ConcurrentStartCannotEraseActiveReceive) {
   EXPECT_EQ(ER_CLONE_PROTOCOL, myrocks::rocksdb_clone_apply_begin(nullptr,
       nullptr, second, length, task, HA_CLONE_MODE_START, nullptr));
   EXPECT_TRUE(fs::exists(stage + "/CURRENT"));
-  EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, first,
-      length, 0, ER_QUERY_INTERRUPTED));
+  EXPECT_EQ(ER_QUERY_INTERRUPTED, myrocks::rocksdb_clone_apply_end(nullptr,
+      nullptr, first, length, 0, ER_QUERY_INTERRUPTED));
 }
 
 class ApplyCallback : public Ha_clone_cbk {
