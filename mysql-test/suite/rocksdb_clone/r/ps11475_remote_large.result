@@ -34,6 +34,7 @@ id	LENGTH(payload)	SHA2(payload, 256)
 9	1048576	8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b
 10	1048576	8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b
 include/assert.inc [Provisioning must open the donor's column families and retain its rows]
+include/assert.inc [Provisioning must remove the recipient's old tables]
 DROP TABLE clone_i, clone_r;
 UNINSTALL PLUGIN clone;
 DROP TABLE clone_i, clone_r;

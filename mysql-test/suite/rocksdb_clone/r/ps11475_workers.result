@@ -19,6 +19,7 @@ SELECT id FROM clone_r ORDER BY id;
 id
 7
 include/assert.inc [Provisioning must open the donor's column families and retain its rows]
+include/assert.inc [Provisioning must remove the recipient's old tables]
 DROP TABLE clone_i, clone_r;
 UNINSTALL PLUGIN clone;
 DROP TABLE clone_i, clone_r;

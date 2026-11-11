@@ -57,6 +57,12 @@ if ($large_file)
 --let $assert_text = Provisioning must open the donor's column families and retain its rows
 --let $assert_cond = `SELECT (SELECT COUNT(*) FROM clone_i WHERE id=7)=1 AND (SELECT COUNT(*) FROM clone_r WHERE id=7)=1`
 --source include/assert.inc
+--let $assert_text = Provisioning must remove the recipient's old tables
+--let $assert_cond = `SELECT COUNT(*)=0 FROM information_schema.tables WHERE table_schema='test' AND table_name='old_recipient'`
+--source include/assert.inc
+# The old RocksDB database is destroyed once the received one opened.
+--let $backup = `SELECT CONCAT(@@datadir, @@rocksdb_datadir, '_clone_old')`
+--exec test ! -d "$backup"
 DROP TABLE clone_i, clone_r;
 UNINSTALL PLUGIN clone;
 --disconnect recipient

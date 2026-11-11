@@ -47,6 +47,10 @@ in between would be present in InnoDB and in the cloned GTID set, but absent
 from the blocking engine. The donor master owns this guard until all engines
 finish copying, so donor writes stay blocked for the whole clone. A donor
 without any blocking engine installed keeps the online InnoDB-only behaviour.
+Like FLUSH TABLES WITH READ LOCK, acquiring the lock waits up to
+clone_ddl_timeout, the recipient value for a remote clone, for running
+statements to finish their use of tables. The lock then also blocks the
+replica applier on the donor until the clone ends.
 */
 class Clone_read_lock {
  public:
