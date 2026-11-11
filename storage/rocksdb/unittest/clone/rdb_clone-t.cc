@@ -1,7 +1,6 @@
-// Contract tests for the PS-11475 clone implementation.
+// Contract tests for the MyRocks clone implementation.
 // The implementation is included unchanged; only its two engine accessors
 // are supplied by this fixture. Filesystem operations use real temporary files.
-#undef MYSQL_DYNAMIC_PLUGIN
 #define DISABLE_ERROR_LOGGING
 #include <gtest/gtest.h>
 #include <filesystem>
@@ -536,12 +535,4 @@ TEST_F(CloneContract, ApplyOwnsDescriptorAcrossCallbackBufferReuse) {
             clone_messages.back());
   EXPECT_EQ(0, myrocks::rocksdb_clone_apply_end(nullptr, nullptr, locator,
       length, task, 0));
-}
-
-int main(int argc, char **argv) {
-  MY_INIT(argv[0]);
-  ::testing::InitGoogleTest(&argc, argv);
-  const int result = RUN_ALL_TESTS();
-  my_end(0);
-  return result;
 }

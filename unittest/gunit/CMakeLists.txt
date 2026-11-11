@@ -442,6 +442,13 @@ FOREACH(test ${SERVER_TESTS})
   )
 ENDFOREACH()
 
+# The clone plugin coordinator, with fake engines and plugin registry.
+MYSQL_ADD_EXECUTABLE(clone_hton-t clone_hton-t.cc
+  ENABLE_EXPORTS
+  ADD_TEST clone_hton
+  LINK_LIBRARIES gunit_small
+)
+
 ADD_LIBRARY(rpl_channel_credentials_lib STATIC
   ${CMAKE_SOURCE_DIR}/sql/rpl_channel_credentials.cc
 )

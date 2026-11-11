@@ -1,11 +1,18 @@
 // Exercise the production clone coordinator with small engine callbacks.
-// The plugin registry is the only server service replaced by this fixture.
-#undef MYSQL_DYNAMIC_PLUGIN
+// The fixture replaces the plugin registry, and the global read lock calls
+// of the donor, which only MTR tests exercise.
 #define DISABLE_ERROR_LOGGING
 #include <gtest/gtest.h>
 #include <array>
 #include <filesystem>
 #include "plugin/clone/src/clone_hton.cc"
+
+bool close_cached_tables(THD *, Table_ref *, bool, ulong) { return true; }
+bool Global_read_lock::lock_global_read_lock(THD *) { return true; }
+void Global_read_lock::unlock_global_read_lock(THD *) {}
+bool Global_read_lock::make_global_read_lock_block_commit(THD *) {
+  return true;
+}
 
 namespace {
 std::array<handlerton, 3> engines;
