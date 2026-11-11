@@ -356,10 +356,23 @@ static uint32_t locator_session_id(const uchar *loc) {
   return reinterpret_cast<const Rdb_clone_locator *>(loc)->session_id;
 }
 
-static int clone_protocol_error() {
-  my_error(ER_CLONE_PROTOCOL, MYF(0), "Invalid RocksDB clone descriptor");
+/** Report a clone protocol violation to the session. Every error returned to
+the clone plugin must be raised: the plugin forwards the diagnostics area to
+the client, or reports "Unknown Error" when it is empty.
+@param[in]  message  description of the violation
+@return ER_CLONE_PROTOCOL */
+static int clone_protocol_error(
+    const char *message = "Invalid RocksDB clone descriptor") {
+  my_error(ER_CLONE_PROTOCOL, MYF(0), message);
   return ER_CLONE_PROTOCOL;
 }
+
+static constexpr const char *RDB_CLONE_BAD_LOCATOR =
+    "Invalid RocksDB clone locator";
+static constexpr const char *RDB_CLONE_NO_SESSION =
+    "RocksDB clone session not found";
+static constexpr const char *RDB_CLONE_NO_TASK =
+    "RocksDB clone task not attached";
 
 /* Only flat checkpoint files may be supplied by the donor. In particular,
 completion markers and paths outside the stage are never wire filenames. */
@@ -405,10 +418,12 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
   }
 
   if (mode == HA_CLONE_MODE_ADD_TASK) {
-    if (!validate_locator(loc, loc_len)) return ER_CLONE_PROTOCOL;
+    if (!validate_locator(loc, loc_len))
+      return clone_protocol_error(RDB_CLONE_BAD_LOCATOR);
     std::lock_guard<std::mutex> guard(g_clone_mutex);
     const auto it = g_clone_sessions.find(locator_session_id(loc));
-    if (it == g_clone_sessions.end()) return ER_CLONE_PROTOCOL;
+    if (it == g_clone_sessions.end())
+      return clone_protocol_error(RDB_CLONE_NO_SESSION);
     auto &session = it->second;
     task_id = session.next_task++;
     session.active.insert(task_id);
@@ -493,7 +508,8 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
 
 int rocksdb_clone_copy(handlerton *hton, THD *, const uchar *loc,
                        uint loc_len, uint task_id, Ha_clone_cbk *cbk) {
-  if (!validate_locator(loc, loc_len)) return HA_EXIT_FAILURE;
+  if (!validate_locator(loc, loc_len))
+    return clone_protocol_error(RDB_CLONE_BAD_LOCATOR);
 
   const uint32_t sid = locator_session_id(loc);
 
@@ -502,8 +518,10 @@ int rocksdb_clone_copy(handlerton *hton, THD *, const uchar *loc,
   {
     std::lock_guard<std::mutex> guard(g_clone_mutex);
     const auto it = g_clone_sessions.find(sid);
-    if (it == g_clone_sessions.end()) return HA_EXIT_FAILURE;
-    if (it->second.active.count(task_id) == 0) return ER_CLONE_PROTOCOL;
+    if (it == g_clone_sessions.end())
+      return clone_protocol_error(RDB_CLONE_NO_SESSION);
+    if (it->second.active.count(task_id) == 0)
+      return clone_protocol_error(RDB_CLONE_NO_TASK);
     /* The master streams the checkpoint; workers participate in InnoDB. */
     if (task_id != 0) return 0;
     checkpoint_dir = it->second.checkpoint_dir;
@@ -573,7 +591,8 @@ int rocksdb_clone_ack(handlerton *, THD *, const uchar *, uint, uint, int,
 
 int rocksdb_clone_end(handlerton *, THD *, const uchar *loc, uint loc_len,
                       uint task_id, int in_err) {
-  if (!validate_locator(loc, loc_len)) return ER_CLONE_PROTOCOL;
+  if (!validate_locator(loc, loc_len))
+    return clone_protocol_error(RDB_CLONE_BAD_LOCATOR);
   const uint32_t sid = locator_session_id(loc);
   if (sid == 0) {
     delete[] loc;
@@ -583,8 +602,10 @@ int rocksdb_clone_end(handlerton *, THD *, const uchar *loc, uint loc_len,
   {
     std::lock_guard<std::mutex> guard(g_clone_mutex);
     const auto it = g_clone_sessions.find(sid);
-    if (it == g_clone_sessions.end() ||
-        it->second.active.erase(task_id) != 1) return ER_CLONE_PROTOCOL;
+    if (it == g_clone_sessions.end())
+      return clone_protocol_error(RDB_CLONE_NO_SESSION);
+    if (it->second.active.erase(task_id) != 1)
+      return clone_protocol_error(RDB_CLONE_NO_TASK);
     if (in_err != 0) it->second.error = in_err;
     if (!it->second.active.empty()) return 0;
     checkpoint_dir = it->second.checkpoint_dir;
@@ -612,12 +633,13 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
   }
 
   if (!validate_locator(loc, loc_len) || locator_session_id(loc) == 0)
-    return ER_CLONE_PROTOCOL;
+    return clone_protocol_error(RDB_CLONE_BAD_LOCATOR);
   const uint32_t session_id = locator_session_id(loc);
   std::lock_guard<std::mutex> guard(g_clone_mutex);
   if (mode == HA_CLONE_MODE_ADD_TASK) {
     const auto it = g_apply_sessions.find(session_id);
-    if (it == g_apply_sessions.end()) return ER_CLONE_PROTOCOL;
+    if (it == g_apply_sessions.end())
+      return clone_protocol_error(RDB_CLONE_NO_SESSION);
     task_id = it->second.next_task++;
     it->second.active.insert(task_id);
     /* Auxiliary apply must not replace a donor locator used by local copy. */
@@ -678,7 +700,11 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
 
   /* Remove any leftover staging dir from a previous failed attempt. */
   if (is_provisioning) {
-    if (clone_is_complete(write_dir)) return clone_protocol_error();
+    /* A completed stage is installed by the next startup. Never replace it
+    with a new receive: the InnoDB part of that clone is already final. */
+    if (clone_is_complete(write_dir))
+      return clone_protocol_error(
+          "RocksDB clone stage is waiting for a server restart");
     remove_clone_stage(write_dir);
   }
 
@@ -707,7 +733,8 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
 int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
                         uint task_id, int in_err, Ha_clone_cbk *cbk) {
   if (in_err != 0) return in_err;
-  if (!validate_locator(loc, loc_len)) return HA_EXIT_FAILURE;
+  if (!validate_locator(loc, loc_len))
+    return clone_protocol_error(RDB_CLONE_BAD_LOCATOR);
 
   uint desc_len = 0;
   const uchar *desc_buf = cbk->get_data_desc(&desc_len);
@@ -745,11 +772,8 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
   {
     std::lock_guard<std::mutex> guard(g_clone_mutex);
     const auto it = g_apply_sessions.find(sid);
-    if (it == g_apply_sessions.end()) {
-      LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                      "RocksDB clone_apply: session %u not found!", sid);
-      return HA_EXIT_FAILURE;
-    }
+    if (it == g_apply_sessions.end())
+      return clone_protocol_error(RDB_CLONE_NO_SESSION);
     auto &session = it->second;
     if (task_id != 0 || session.active.count(task_id) == 0 ||
         desc->file_index != session.next_file ||
@@ -839,29 +863,33 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
   bool is_provisioning = false;
   const int input_error = in_err;
 
-  if (validate_locator(loc, loc_len)) {
-    const uint32_t sid = locator_session_id(loc);
-    if (sid == 0) {
-      delete[] loc;
-      return 0;
-    }
+  /* After an earlier error, only cleanup matters: do not report another. */
+  if (!validate_locator(loc, loc_len))
+    return input_error == 0 ? clone_protocol_error(RDB_CLONE_BAD_LOCATOR) : 0;
+  const uint32_t sid = locator_session_id(loc);
+  if (sid == 0) {
+    delete[] loc;
+    return 0;
+  }
+  {
     const auto it = g_apply_sessions.find(sid);
-    if (it != g_apply_sessions.end()) {
-      if (it->second.active.erase(task_id) != 1) return ER_CLONE_PROTOCOL;
-      if (in_err != 0) it->second.error = in_err;
-      if (!it->second.active.empty()) return 0;
-      in_err = it->second.error;
-      if (in_err == 0 && (it->second.file_count == 0 ||
-                         it->second.next_file != it->second.file_count))
-        in_err = clone_protocol_error();
-      rocksdb_dir = it->second.rocksdb_dir;
-      write_dir = it->second.write_dir;
-      is_provisioning = it->second.is_provisioning;
-      g_apply_sessions.erase(it);
-    }
+    if (it == g_apply_sessions.end())
+      return input_error == 0 ? clone_protocol_error(RDB_CLONE_NO_SESSION) : 0;
+    if (it->second.active.erase(task_id) != 1)
+      return clone_protocol_error(RDB_CLONE_NO_TASK);
+    if (in_err != 0) it->second.error = in_err;
+    if (!it->second.active.empty()) return 0;
+    in_err = it->second.error;
+    if (in_err == 0 && (it->second.file_count == 0 ||
+                       it->second.next_file != it->second.file_count))
+      in_err = clone_protocol_error("RocksDB clone ended before all files");
+    rocksdb_dir = it->second.rocksdb_dir;
+    write_dir = it->second.write_dir;
+    is_provisioning = it->second.is_provisioning;
+    g_apply_sessions.erase(it);
   }
 
-  if (!is_provisioning || write_dir.empty() || rocksdb_dir.empty()) {
+  if (!is_provisioning) {
     if (in_err == 0 && !write_dir.empty() &&
         (!sync_clone_directory(write_dir) ||
          !sync_clone_directory(clone_parent_dir(write_dir))))
