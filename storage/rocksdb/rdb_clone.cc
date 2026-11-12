@@ -234,8 +234,9 @@ static bool clone_rename_directory(const std::string &from,
                                    const std::string &to) {
   if (my_rename(from.c_str(), to.c_str(), MYF(MY_WME)) != 0 ||
       !sync_clone_directory(clone_parent_dir(to))) {
-    LogPluginErrMsg(ERROR_LEVEL, 0, "RocksDB clone: cannot rename %s to %s: %d",
-                    from.c_str(), to.c_str(), errno);
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                    "RocksDB clone: cannot rename %s to %s: %d", from.c_str(),
+                    to.c_str(), errno);
     return false;
   }
   return true;
@@ -268,7 +269,7 @@ void rdb_clone_init() {
   for (uint i = 0; i < dir->number_off_files; i++) {
     const std::string name = dir->dir_entry[i].name;
     if (name.compare(0, name_prefix.size(), name_prefix) != 0) continue;
-    LogPluginErrMsg(WARNING_LEVEL, 0,
+    LogPluginErrMsg(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
                     "RocksDB clone: removing stale checkpoint %s%s",
                     parent.c_str(), name.c_str());
     rocksdb::DestroyDB(parent + name, rocksdb::Options());
@@ -303,16 +304,16 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
   if (!clone_directory_exists(staging_dir)) {
     if (!have_backup) return Rdb_clone_recovery::NONE;
     if (!have_live) {
-      LogPluginErrMsg(WARNING_LEVEL, 0,
-                      "RocksDB clone: restoring %s from %s",
-                      live_dir.c_str(), backup_dir.c_str());
+      LogPluginErrMsg(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+                      "RocksDB clone: restoring %s from %s", live_dir.c_str(),
+                      backup_dir.c_str());
       if (!clone_rename_directory(backup_dir, live_dir))
         return Rdb_clone_recovery::ERROR;
       return Rdb_clone_recovery::NONE;
     }
     /* Installation finished, but engine recovery or backup cleanup did not. */
     if (committed) return Rdb_clone_recovery::INSTALLED;
-    LogPluginErrMsg(WARNING_LEVEL, 0,
+    LogPluginErrMsg(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
                     "RocksDB clone: %s is left from an installed clone; "
                     "remove it to allow provisioning clones again",
                     backup_dir.c_str());
@@ -323,26 +324,26 @@ Rdb_clone_recovery rdb_clone_apply_pending(const char *rocksdb_dir) {
     /* The clone failed, crashed before its commit, or was abandoned by
     another engine. */
     if (have_backup) {
-      LogPluginErrMsg(ERROR_LEVEL, 0,
+      LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                       "RocksDB clone: uncommitted %s found next to saved %s",
                       staging_dir.c_str(), backup_dir.c_str());
       return Rdb_clone_recovery::ERROR;
     }
-    LogPluginErrMsg(INFORMATION_LEVEL, 0,
+    LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                     "RocksDB clone: discarding uncommitted %s",
                     staging_dir.c_str());
     remove_clone_stage(staging_dir);
     return Rdb_clone_recovery::NONE;
   }
 
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                  "RocksDB clone: installing %s into %s",
-                  staging_dir.c_str(), live_dir.c_str());
+  LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                  "RocksDB clone: installing %s into %s", staging_dir.c_str(),
+                  live_dir.c_str());
   if (have_backup) {
     /* After the first rename, the backup is the only old copy. Never
     destroy it or replace an unexpected live directory on a retry. */
     if (have_live) {
-      LogPluginErrMsg(ERROR_LEVEL, 0,
+      LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                       "RocksDB clone: %s, %s and committed %s all exist",
                       live_dir.c_str(), backup_dir.c_str(),
                       staging_dir.c_str());
@@ -369,14 +370,14 @@ void rdb_clone_finish_pending(const char *rocksdb_dir) {
   const auto status = rocksdb::DestroyDB(backup_dir, rocksdb::Options());
   if (!status.ok() || clone_directory_exists(backup_dir) ||
       !sync_clone_directory(clone_parent_dir(live_dir))) {
-    LogPluginErrMsg(WARNING_LEVEL, 0,
+    LogPluginErrMsg(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
                     "RocksDB clone: cannot remove %s: %s; remove it to "
                     "allow provisioning clones again",
                     backup_dir.c_str(), status.ToString().c_str());
     return;
   }
-  LogPluginErrMsg(INFORMATION_LEVEL, 0, "RocksDB clone: installed %s",
-                  live_dir.c_str());
+  LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                  "RocksDB clone: installed %s", live_dir.c_str());
 }
 
 /* ---- Internal helpers ---- */
@@ -498,7 +499,7 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
       clone_live_dir(rdb_get_rocksdb_datadir()) + RDB_CLONE_CHECKPOINT +
       std::to_string(session_id);
 
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
+  LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                   "RocksDB clone_begin: creating checkpoint at %s",
                   checkpoint_dir.c_str());
   rocksdb::Checkpoint *ckpt = nullptr;
@@ -529,7 +530,7 @@ int rocksdb_clone_begin(handlerton *, THD *, const uchar *&loc, uint &loc_len,
         {name, static_cast<uint64_t>(dir->dir_entry[i].mystat->st_size)});
   }
   my_dirend(dir);
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
+  LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                   "RocksDB clone_begin: session %u, %zu files in checkpoint",
                   session_id, session.files.size());
 
@@ -564,7 +565,7 @@ int rocksdb_clone_copy(handlerton *hton, THD *, const uchar *loc,
     files = it->second.files;
   }
 
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
+  LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                   "RocksDB clone_copy: sid=%u, %zu files from %s", sid,
                   files.size(), checkpoint_dir.c_str());
 
@@ -575,7 +576,7 @@ int rocksdb_clone_copy(handlerton *hton, THD *, const uchar *loc,
         checkpoint_dir + "/" + files[idx].rel_path;
     const uint64_t file_size = files[idx].file_size;
 
-    LogPluginErrMsg(INFORMATION_LEVEL, 0,
+    LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                     "RocksDB clone_copy: file[%u] %s size=%llu", idx,
                     files[idx].rel_path.c_str(),
                     static_cast<unsigned long long>(file_size));
@@ -615,7 +616,7 @@ int rocksdb_clone_copy(handlerton *hton, THD *, const uchar *loc,
     if (err != 0) return err;
   }
 
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
+  LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                   "RocksDB clone_copy: all %zu files sent", files.size());
   return 0;
 }
@@ -754,7 +755,7 @@ int rocksdb_clone_apply_begin(handlerton *, THD *, const uchar *&loc,
   loc = session.locator.get();
   task_id = 0;
   g_apply_sessions.emplace(session_id, std::move(session));
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
+  LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                   "RocksDB clone_apply_begin: session %u, write_dir: %s",
                   session_id, write_dir.c_str());
   return 0;
@@ -791,9 +792,8 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
 
   /* Called once per chunk: log only file boundaries and failures. */
   if (offset == 0)
-    LogPluginErrMsg(INFORMATION_LEVEL, 0,
-                    "RocksDB clone_apply: file '%s' size=%llu",
-                    desc->rel_path,
+    LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                    "RocksDB clone_apply: file '%s' size=%llu", desc->rel_path,
                     static_cast<unsigned long long>(desc->file_size));
 
   const uint32_t sid = locator_session_id(loc);
@@ -864,7 +864,7 @@ int rocksdb_clone_apply(handlerton *, THD *, const uchar *loc, uint loc_len,
   if (my_close(dest_fd, MYF(MY_WME)) != 0 && err == 0)
     err = clone_io_error();
   if (err != 0 || last_chunk)
-    LogPluginErrMsg(INFORMATION_LEVEL, 0,
+    LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                     "RocksDB clone_apply: apply_file_cbk for '%s' returned %d",
                     desc->rel_path, err);
   {
@@ -918,7 +918,7 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
   if (!session.is_provisioning) return err;
 
   if (err != 0) {
-    LogPluginErrMsg(INFORMATION_LEVEL, 0,
+    LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                     "RocksDB clone_apply_end: clone error %d, "
                     "removing staging dir %s",
                     err, session.write_dir.c_str());
@@ -926,7 +926,7 @@ int rocksdb_clone_apply_end(handlerton *, THD *, const uchar *loc,
     return err;
   }
   /* The live engine stays open until mysqld shuts down. */
-  LogPluginErrMsg(INFORMATION_LEVEL, 0,
+  LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                   "RocksDB clone_apply_end: staging dir %s prepared; "
                   "install deferred to next startup",
                   session.write_dir.c_str());

@@ -8315,7 +8315,7 @@ static int rocksdb_init_internal(void *const p) {
   /* Install before any logger, column-family discovery or options check
   touches the database. All initialization must describe the same files. */
   if (rdb_clone_apply_pending(rocksdb_datadir) == Rdb_clone_recovery::ERROR) {
-    LogPluginErrMsg(ERROR_LEVEL, 0,
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                     "RocksDB clone recovery could not safely install files");
     DBUG_RETURN(HA_EXIT_FAILURE);
   }
