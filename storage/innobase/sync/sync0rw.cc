@@ -40,8 +40,16 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "sync0rw.h"
 
+#include "univ.i"
+
+#include <bit>
+#include <cstdio>
+#include <new>
+#include <string>
+#include <thread>
+#include <vector>
+
 #include <my_sys.h>
-#include <sys/types.h>
 
 #include "ha_prototypes.h"
 #include "mem0mem.h"
@@ -50,6 +58,72 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "sync0debug.h"
+#include "sync0types.h"
+#include "ut0core.h"
+#include "ut0lst.h"
+
+Rw_lock_holders &Rw_lock_holders::instance() {
+  static Rw_lock_holders holders;
+  return holders;
+}
+
+void Rw_lock_holders::Thread_table::grow() {
+  if (cap >= k_max_cap) {
+    /* Occupancy is already at the 50% ceiling of the largest table. */
+    ut_error;
+  }
+  const size_t new_cap = cap << 1;
+  Slot *fresh = new (std::nothrow) Slot[new_cap]{};
+  if (fresh == nullptr) {
+    ut_error;
+  }
+
+  const int shift = 64 - std::bit_width(new_cap - 1);
+  for (size_t i = 0; i < cap; ++i) {
+    Slot &src = slots[i];
+    if (src.lock == nullptr) {
+      continue;
+    }
+    const auto x = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(src.lock));
+    const size_t h = static_cast<size_t>((x * k_mix) >> shift);
+    bool placed = false;
+    for (size_t n = 0; n < new_cap; ++n) {
+      Slot &dst = fresh[(h + n) & (new_cap - 1)];
+      if (dst.lock != nullptr) {
+        continue;
+      }
+      dst = src;
+      placed = true;
+      break;
+    }
+    if (!placed) {
+      delete[] fresh;
+      ut_error;
+    }
+  }
+
+  /* Publish under m_mutex so a deadlock scan walks either the old table or
+  the new one, never a freed one. The scan holds m_mutex for the whole walk. */
+  Slot *old = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(Rw_lock_holders::instance().m_mutex);
+    old = heap;
+    heap = fresh;
+    slots = fresh;
+    cap = new_cap;
+  }
+  delete[] old;
+}
+
+Rw_lock_holders::Thread_table &Rw_lock_holders::mine() {
+  struct Registered {
+    Thread_table table;
+    Registered() { Rw_lock_holders::instance().link(&table); }
+    ~Registered() { Rw_lock_holders::instance().unlink(&table); }
+  };
+  thread_local Registered registered;
+  return registered.table;
+}
 
 /*
         IMPLEMENTATION OF THE RW_LOCK
@@ -188,8 +262,9 @@ static rw_lock_debug_t *rw_lock_debug_create(void) {
 static void rw_lock_debug_free(rw_lock_debug_t *info) { ut::free(info); }
 #endif /* UNIV_DEBUG */
 
-void rw_lock_create_func(rw_lock_t *lock,
-                         IF_DEBUG(latch_id_t id, ) ut::Location clocation) {
+void rw_lock_create_unregistered_func(rw_lock_t *lock,
+                                      IF_DEBUG(latch_id_t id, )
+                                          ut::Location clocation) {
 #if !defined(UNIV_PFS_RWLOCK)
   /* It should have been created in pfs_rw_lock_create_func() */
   new (lock) rw_lock_t();
@@ -223,14 +298,15 @@ void rw_lock_create_func(rw_lock_t *lock,
         std::numeric_limits<decltype(lock->clocation.line)>::max());
 
   lock->count_os_wait = 0;
-  lock->last_s_file_name = "not yet reserved";
-  lock->last_x_file_name = "not yet reserved";
-  lock->last_s_line = 0;
-  lock->last_x_line = 0;
   lock->event = os_event_create();
   lock->wait_ex_event = os_event_create();
 
   lock->is_block_lock = false;
+}
+
+void rw_lock_create_func(rw_lock_t *lock,
+                         IF_DEBUG(latch_id_t id, ) ut::Location clocation) {
+  rw_lock_create_unregistered_func(lock, IF_DEBUG(id, ) clocation);
 
   mutex_enter(&rw_lock_list_mutex);
 
@@ -240,6 +316,32 @@ void rw_lock_create_func(rw_lock_t *lock,
   UT_LIST_ADD_FIRST(rw_lock_list, lock);
 
   mutex_exit(&rw_lock_list_mutex);
+}
+
+void rw_lock_list_register_bulk(rw_lock_list_t &&locks) {
+  if (UT_LIST_GET_LEN(locks) == 0) {
+    return;
+  }
+
+  /* Sanity-check an incoming lock: it must have been fully prepared through
+  rw_lock_create_unregistered_func() (the list is non-empty here, guaranteed by
+  the early return above). */
+  ut_ad(UT_LIST_GET_FIRST(locks)->magic_n == rw_lock_t::MAGIC_N);
+
+  mutex_enter(&rw_lock_list_mutex);
+
+  ut_ad(UT_LIST_GET_FIRST(rw_lock_list) == nullptr ||
+        UT_LIST_GET_FIRST(rw_lock_list)->magic_n == rw_lock_t::MAGIC_N);
+
+  /* O(1) splice of the prepared list onto the global list. The per-lock work
+  (initialization and list linkage) was already done outside this mutex. */
+  UT_LIST_CONCATENATE(rw_lock_list, locks);
+
+  mutex_exit(&rw_lock_list_mutex);
+
+  /* The moved-from list base node is left empty: the locks now live on
+  rw_lock_list only. */
+  ut_ad(UT_LIST_GET_LEN(locks) == 0);
 }
 
 /** Calling this function is obligatory only if the memory buffer containing
@@ -269,6 +371,42 @@ rw_lock_t::~rw_lock_t() {
   ut_ad(magic_n == MAGIC_N);
   ut_d(magic_n = 0);
 }
+
+#ifdef UNIV_DEBUG
+/** Asserts that the calling thread is allowed to start waiting for the
+given rw-lock.
+
+This is the hook for latch-order rules which cannot be expressed through
+latch_level_t ordering and which constrain only actual waits, not
+non-blocking acquisitions (the rw_lock_*_nowait() variants never reach
+this, by design: an acquisition that never waits cannot participate in a
+deadlock cycle). It is called at the only spots where an rw-lock
+acquisition starts to wait - every unbounded wait, spinning included,
+funnels into a sync array reservation.
+
+Currently there is one such rule, for the buffer block frame locks
+(buf_block_t::lock): a thread must not wait for a frame lock while
+holding any buffer pool LRU list mutex. buf_page_init_for_read() acquires
+buf_pool_t::LRU_list_mutex while holding the X-latch on the frame of the
+page being read in, so such a wait would form a deadlock cycle with that
+path. The rule cannot use latch levels because buf_block_t::lock is
+registered with SYNC_LEVEL_VARYING (B-tree page latching order genuinely
+varies), and LatchDebug ignores such latches entirely - both when they
+are acquired and when they are held. The code paths which do latch a
+frame under the LRU list mutex (flushing, and buf_page_create() on a
+block freshly taken from the free list) use the nowait variants, so they
+are exempt by construction.
+
+Note that this check is only effective when LatchDebug is enabled
+(--innodb-sync-debug); an actual deadlock occurrence is additionally caught
+by the sync array deadlock detector, which does track frame rw-locks. */
+namespace {
+void rw_lock_assert_wait_allowed(const rw_lock_t *lock) {
+  ut_ad(lock->get_id() != LATCH_ID_BUF_BLOCK_LOCK ||
+        sync_check_find(SYNC_BUF_LRU_LIST) == nullptr);
+}
+}  // namespace
+#endif /* UNIV_DEBUG */
 
 void rw_lock_s_lock_spin(rw_lock_t *lock, ulint pass, ut::Location location) {
   ulint i = 0; /* spin round count */
@@ -309,6 +447,8 @@ lock_loop:
     }
 
     ++count_os_wait;
+
+    ut_d(rw_lock_assert_wait_allowed(lock));
 
     sync_cell_t *cell;
 
@@ -392,6 +532,8 @@ static inline void rw_lock_x_lock_wait_func(rw_lock_t *lock,
     }
 
     /* If there is still a reader, then go to sleep.*/
+    ut_d(rw_lock_assert_wait_allowed(lock));
+
     sync_cell_t *cell;
 
     sync_arr = sync_array_get_and_reserve_cell(lock, RW_LOCK_X_WAIT,
@@ -500,9 +642,7 @@ static inline bool rw_lock_x_lock_low(
 
   ut_d(rw_lock_add_debug_info(lock, pass, RW_LOCK_X, {file_name, line}));
 
-  lock->last_x_file_name = file_name;
-  ut_ad(line <= std::numeric_limits<decltype(lock->last_x_line)>::max());
-  lock->last_x_line = line;
+  Rw_lock_holders::instance().note(lock, pass, {file_name, line}, RW_LOCK_X);
 
   return true;
 }
@@ -561,11 +701,7 @@ bool rw_lock_sx_lock_low(rw_lock_t *lock, ulint pass, ut::Location location) {
 
   ut_d(rw_lock_add_debug_info(lock, pass, RW_LOCK_SX, location));
 
-  lock->last_x_file_name = location.filename;
-
-  ut_ad(location.line <=
-        std::numeric_limits<decltype(lock->last_x_line)>::max());
-  lock->last_x_line = location.line;
+  Rw_lock_holders::instance().note(lock, pass, location, RW_LOCK_SX);
 
   return true;
 }
@@ -611,6 +747,8 @@ lock_loop:
       goto lock_loop;
     }
   }
+
+  ut_d(rw_lock_assert_wait_allowed(lock));
 
   sync_cell_t *cell;
 
@@ -676,6 +814,8 @@ lock_loop:
       goto lock_loop;
     }
   }
+
+  ut_d(rw_lock_assert_wait_allowed(lock));
 
   sync_cell_t *cell;
 

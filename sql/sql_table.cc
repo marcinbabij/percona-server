@@ -2882,6 +2882,7 @@ static bool drop_base_table(THD *thd, const Drop_tables_ctx &drop_ctx,
                             Foreign_key_parents_invalidator *fk_invalidator,
                             std::vector<MDL_ticket *> *safe_to_release_mdl,
                             MEM_ROOT *foreach_table_root) {
+  THD_STAGE_INFO(thd, stage_dropping_table);
   char path[FN_REFLEN + 1];
 
   /* Check that we have an exclusive lock on the table to be dropped. */
@@ -2908,6 +2909,10 @@ static bool drop_base_table(THD *thd, const Drop_tables_ctx &drop_ctx,
     assert(true);
     return true;
   }
+
+  Table_ddl_hton_notification_guard notification_guard{
+      thd, &(table->mdl_request.key), ha_ddl_type::HA_DROP_DDL};
+  if (!is_temporary_table(table) && notification_guard.notify()) return true;
 
   // Drop table from secondary engine.
   if (secondary_engine_unload_table(thd, table->db, table->table_name,
@@ -3163,7 +3168,7 @@ static bool drop_base_table(THD *thd, const Drop_tables_ctx &drop_ctx,
   result |= mark_referencing_views_invalid(thd, table,
                                            (drop_ctx.drop_database && atomic),
                                            !atomic, foreach_table_root);
-
+  THD_STAGE_INFO(thd, stage_after_drop);
   return result;
 }
 
@@ -17072,7 +17077,10 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
     from/notify interested storage engines.
   */
   Table_ddl_hton_notification_guard notification_guard{
-      thd, &table_list->mdl_request.key, HA_ALTER_DDL};
+      thd,          &table_list->mdl_request.key,
+      HA_ALTER_DDL, nullptr,
+      nullptr,      nullptr,
+      nullptr,      alter_info->flags};
 
   if (!is_temporary_table(table_list) && notification_guard.notify())
     return true;
@@ -19217,6 +19225,7 @@ static int copy_data_between_tables(
   DBUG_TRACE;
 
   int error;
+  int tmp_error;
   Copy_field *copy, *copy_end;
   Field **ptr;
   /*
@@ -19496,7 +19505,11 @@ static int copy_data_between_tables(
   }
 
   if (!expand_fast_index_creation) {
-    to->file->ha_extra(HA_EXTRA_END_ALTER_COPY);
+    tmp_error = to->file->ha_extra(HA_EXTRA_END_ALTER_COPY);
+    if (tmp_error && error <= 0) {
+      to->file->print_error(tmp_error, MYF(0));
+      error = 1;
+    }
   }
 
   DBUG_EXECUTE_IF("crash_copy_before_commit", DBUG_SUICIDE(););

@@ -825,8 +825,8 @@ MySQL clients support the protocol:
 #include "sql/regexp/regexp_facade.h"     // regexp::regexp_lib_charset
 #include "sql/replication.h"              // thd_enter_cond
 #include "sql/resourcegroups/resource_group_mgr.h"  // init, post_init
-#include "sql/statement/statement.h"
 #include "sql/sql_profile.h"
+#include "sql/statement/statement.h"
 #ifdef _WIN32
 #include "sql/restart_monitor_win.h"
 #endif
@@ -4725,6 +4725,10 @@ SHOW_VAR com_status_vars[] = {
      (char *)offsetof(System_status_var,
                       com_stat[(uint)SQLCOM_SHOW_ENGINE_STATUS]),
      SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
+    {"show_engine_trans",
+     (char *)offsetof(System_status_var,
+                      com_stat[(uint)SQLCOM_SHOW_ENGINE_TRX]),
+     SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
     {"show_events",
      (char *)offsetof(System_status_var, com_stat[(uint)SQLCOM_SHOW_EVENTS]),
      SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
@@ -5907,6 +5911,11 @@ static PSI_metric_info_v1 com_metrics[] = {
      get_metric_aggregated_integer,
      (void *)offsetof(aggregated_stats_buffer,
                       com_stat[(uint)SQLCOM_SHOW_ENGINE_STATUS])},
+    {"show_engine_trans", "", COM_COMMON_DESCRIPTION,
+     MetricOTELType::ASYNC_COUNTER, MetricNumType::METRIC_INTEGER, 0, 0,
+     get_metric_aggregated_integer,
+     (void *)offsetof(aggregated_stats_buffer,
+                      com_stat[(uint)SQLCOM_SHOW_ENGINE_TRX])},
     {"show_events", "", COM_COMMON_DESCRIPTION, MetricOTELType::ASYNC_COUNTER,
      MetricNumType::METRIC_INTEGER, 0, 0, get_metric_aggregated_integer,
      (void *)offsetof(aggregated_stats_buffer,
@@ -6711,16 +6720,20 @@ void unregister_server_metric_sources() {
 }
 
 PSI_logger_key key_error_logger = 0;
+PSI_logger_key key_slow_query_logger = 0;
+PSI_logger_key key_general_logger = 0;
 
-static PSI_logger_info_v1 err_loggers[] = {
-    {"error_log", "MySQL error logger", 0, &key_error_logger}};
+static PSI_logger_info_v1 sql_loggers[] = {
+    {"error_log", "MySQL error logger", 0, &key_error_logger},
+    {"slow_log", "MySQL slow query logger", 0, &key_slow_query_logger},
+    {"general_log", "MySQL general logger", 0, &key_general_logger}};
 
 void register_server_telemetry_loggers() {
-  mysql_log_client_register(err_loggers, std::size(err_loggers), "error");
+  mysql_log_client_register(sql_loggers, std::size(sql_loggers), "sql");
 }
 
 void unregister_server_telemetry_loggers() {
-  mysql_log_client_unregister(err_loggers, std::size(err_loggers));
+  mysql_log_client_unregister(sql_loggers, std::size(sql_loggers));
 }
 
 int init_common_variables() {
@@ -7272,6 +7285,8 @@ static int init_thread_environment() {
                    &LOCK_password_reuse_interval, MY_MUTEX_INIT_FAST);
   mysql_rwlock_init(key_rwlock_LOCK_sys_init_connect, &LOCK_sys_init_connect);
   mysql_rwlock_init(key_rwlock_LOCK_sys_init_replica, &LOCK_sys_init_replica);
+  mysql_rwlock_init(key_rwlock_LOCK_consistent_snapshot,
+                    &LOCK_consistent_snapshot);
   mysql_cond_init(key_COND_manager, &COND_manager);
   mysql_mutex_init(key_LOCK_server_started, &LOCK_server_started,
                    MY_MUTEX_INIT_FAST);
@@ -9270,15 +9285,31 @@ class Plugin_and_data_dir_option_parser final {
     /* Backup mysql_real_data_home */
     if (mysql_real_data_home[0])
       memcpy(save_homedir_, mysql_real_data_home, strlen(mysql_real_data_home));
-    if (datadir_ != nullptr)
-      memcpy(mysql_real_data_home, datadir_, strlen(datadir_));
+    /*
+      An empty value must not clobber the global. Before the buffer was
+      cleared before copying, an empty datadir_ copied zero bytes and thus
+      left the already initialized default in place. Clearing it first would
+      instead leave mysql_real_data_home empty, which breaks every path
+      derived from it - and trips the assert in
+      initialize_manifest_file_components() right after this parser runs.
+      Keep the default in that case, as if --datadir was not given at all.
+    */
+    if (datadir_ != nullptr && datadir_[0] != '\0') {
+      memset(mysql_real_data_home, 0, sizeof(mysql_real_data_home));
+      strncpy(mysql_real_data_home, datadir_, sizeof(mysql_real_data_home) - 1);
+      mysql_real_data_home[sizeof(mysql_real_data_home) - 1] = '\0';
+    }
 
     /* Backup opt_plugin_dir */
     if (opt_plugin_dir[0])
       memcpy(save_plugindir_, opt_plugin_dir,
              std::min(static_cast<size_t>(FN_REFLEN), strlen(opt_plugin_dir)));
-    if (plugindir_ != nullptr)
-      memcpy(opt_plugin_dir, plugindir_, strlen(plugindir_));
+    /* Same reasoning as for mysql_real_data_home above. */
+    if (plugindir_ != nullptr && plugindir_[0] != '\0') {
+      memset(opt_plugin_dir, 0, sizeof(opt_plugin_dir));
+      strncpy(opt_plugin_dir, plugindir_, sizeof(opt_plugin_dir) - 1);
+      opt_plugin_dir[sizeof(opt_plugin_dir) - 1] = '\0';
+    }
 
     valid_ = true;
   }
@@ -9336,7 +9367,7 @@ int mysqld_main(int argc, char **argv)
   {
     LogErr(ERROR_LEVEL, ER_MYINIT_FAILED);
     flush_error_log_messages();
-    return 1;
+    return MYSQLD_ABORT_EXIT;
   }
 #endif /* _WIN32 */
 
@@ -9347,7 +9378,7 @@ int mysqld_main(int argc, char **argv)
   if (load_defaults(MYSQL_CONFIG_NAME, load_default_groups, &argc, &argv,
                     &argv_alloc)) {
     flush_error_log_messages();
-    return 1;
+    return MYSQLD_ABORT_EXIT;
   }
 
   argc_cached = argc;
@@ -9388,7 +9419,7 @@ int mysqld_main(int argc, char **argv)
       persisted_variables_cache.append_parse_early_variables(
           &argc, &argv, arg_separator_added)) {
     flush_error_log_messages();
-    return 1;
+    return MYSQLD_ABORT_EXIT;
   }
 
   remaining_argc = argc;
@@ -9661,7 +9692,7 @@ int mysqld_main(int argc, char **argv)
   */
   if (component_infrastructure_init()) {
     flush_error_log_messages();
-    return 1;
+    return MYSQLD_ABORT_EXIT;
   }
 
   {
@@ -9672,12 +9703,12 @@ int mysqld_main(int argc, char **argv)
 
     if (keyring_helper->valid() == false) {
       flush_error_log_messages();
-      return 1;
+      return MYSQLD_ABORT_EXIT;
     }
 
     if (initialize_manifest_file_components()) {
       flush_error_log_messages();
-      return 1;
+      return MYSQLD_ABORT_EXIT;
     }
 
     /*
@@ -9696,7 +9727,7 @@ int mysqld_main(int argc, char **argv)
   if (persisted_variables_cache.append_read_only_variables(
           &remaining_argc, &remaining_argv, arg_separator_added, false)) {
     flush_error_log_messages();
-    return 1;
+    return MYSQLD_ABORT_EXIT;
   }
   my_getopt_use_args_separator = false;
 
@@ -10268,13 +10299,13 @@ int mysqld_main(int argc, char **argv)
   if (authentication_policy::init(opt_authentication_policy)) {
     /* --authentication_policy is set to invalid value */
     LogErr(ERROR_LEVEL, ER_INVALID_AUTHENTICATION_POLICY);
-    return 1;
+    unireg_abort(MYSQLD_ABORT_EXIT);
   }
   /* set all persistent options */
   if (persisted_variables_cache.set_persisted_options(false)) {
     LogErr(ERROR_LEVEL, ER_CANT_SET_UP_PERSISTED_VALUES);
     flush_error_log_messages();
-    return 1;
+    unireg_abort(MYSQLD_ABORT_EXIT);
   }
 
   /*
@@ -12955,7 +12986,8 @@ static bool process_opt_pfs_meter(char *argument) {
 pfs_error_meter:
   if (error) {
     // trunk: LogErr(WARNING_LEVEL, ER_INVALID_METER, orig_argument);
-    std::string msg_84("Invalid meter name or value for performance_schema_meter '");
+    std::string msg_84(
+        "Invalid meter name or value for performance_schema_meter '");
     msg_84.append(orig_argument);
     msg_84.append("'.");
     LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, msg_84.c_str());
@@ -13062,7 +13094,8 @@ static bool process_opt_pfs_logger(char *argument) {
 pfs_error_logger:
   if (error) {
     // trunk: LogErr(WARNING_LEVEL, ER_INVALID_LOGGER, orig_argument);
-    std::string msg_84("Invalid logger name or value for performance_schema_logger '");
+    std::string msg_84(
+        "Invalid logger name or value for performance_schema_logger '");
     msg_84.append(orig_argument);
     msg_84.append("'.");
     LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, msg_84.c_str());
@@ -13979,15 +14012,13 @@ static bool check_secure_path(const char *opt_var, const char *variable_name,
 
   auto check_path_overlap = [&](char *buffer, size_t len, const char *message) {
     if (!case_insensitive_fs) {
-      if (!strncmp(buffer, opt_var,
-                   len < opt_var_len ? len : opt_var_len)) {
+      if (!strncmp(buffer, opt_var, len < opt_var_len ? len : opt_var_len)) {
         warn = true;
         strcpy(whichdir, message);
       }
     } else {
-      char *longer_str = opt_datadir_len > opt_var_len
-                             ? buffer
-                             : const_cast<char *>(opt_var);
+      char *longer_str =
+          opt_datadir_len > opt_var_len ? buffer : const_cast<char *>(opt_var);
       const size_t smaller_len = std::min(len, opt_var_len);
       const char restore = longer_str[smaller_len];
       longer_str[smaller_len] = '\0';
@@ -14780,6 +14811,7 @@ static PSI_file_info all_server_files[]=
 
 /* clang-format off */
 PSI_stage_info stage_after_create= { 0, "After create", 0, PSI_DOCUMENT_ME};
+PSI_stage_info stage_after_drop= { 0, "after drop", 0, PSI_DOCUMENT_ME};
 PSI_stage_info stage_alter_inplace_prepare= { 0, "preparing for alter table", 0, PSI_DOCUMENT_ME};
 PSI_stage_info stage_alter_inplace= { 0, "altering table", 0, PSI_DOCUMENT_ME};
 PSI_stage_info stage_alter_inplace_commit= { 0, "committing alter table to storage engine", 0, PSI_DOCUMENT_ME};
@@ -14797,6 +14829,7 @@ PSI_stage_info stage_creating_tmp_table= { 0, "Creating tmp table", 0, PSI_DOCUM
 PSI_stage_info stage_deleting_from_main_table= { 0, "deleting from main table", 0, PSI_DOCUMENT_ME};
 PSI_stage_info stage_deleting_from_reference_tables= { 0, "deleting from reference tables", 0, PSI_DOCUMENT_ME};
 PSI_stage_info stage_discard_or_import_tablespace= { 0, "discard_or_import_tablespace", 0, PSI_DOCUMENT_ME};
+PSI_stage_info stage_dropping_table= { 0, "dropping table", 0, PSI_DOCUMENT_ME};
 PSI_stage_info stage_end= { 0, "end", 0, PSI_DOCUMENT_ME};
 PSI_stage_info stage_executing= { 0, "executing", 0, PSI_DOCUMENT_ME};
 PSI_stage_info stage_execution_of_init_command= { 0, "Execution of init_command", 0, PSI_DOCUMENT_ME};
@@ -14885,6 +14918,7 @@ extern PSI_stage_info stage_waiting_for_disk_space;
 
 PSI_stage_info *all_server_stages[] = {
     &stage_after_create,
+    &stage_after_drop,
     &stage_alter_inplace_prepare,
     &stage_alter_inplace,
     &stage_alter_inplace_commit,
@@ -14902,6 +14936,7 @@ PSI_stage_info *all_server_stages[] = {
     &stage_deleting_from_main_table,
     &stage_deleting_from_reference_tables,
     &stage_discard_or_import_tablespace,
+    &stage_dropping_table,
     &stage_end,
     &stage_executing,
     &stage_execution_of_init_command,

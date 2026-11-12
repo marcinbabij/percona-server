@@ -38,6 +38,10 @@
 /** the max allowed length for a user name */
 #define MYSQL_USERNAME_LENGTH 96
 
+#ifndef MYSQL_ABI_CHECK
+#include <stdbool.h>
+#endif
+
 /**
   return values of the plugin authenticate_user() method.
 */
@@ -102,6 +106,12 @@
 */
 #define CR_OK_AUTH_IN_SANDBOX_MODE -3
 /**
+  Authentication was successful with limited operations.
+  User should change the password.
+*/
+#define CR_OK_FORCE_PASSWORD_CHANGE -4
+
+/**
 Flag to be passed back to server from authentication plugins via
 authenticated_as when proxy mapping should be done by the server.
 */
@@ -127,6 +137,7 @@ struct MYSQL_PLUGIN_VIO_INFO {
     MYSQL_VIO_MEMORY
   } protocol;
   int socket; /**< it's set, if the protocol is SOCKET or TCP */
+  bool is_tls_established;
 #if defined(_WIN32) && !defined(MYSQL_ABI_CHECK)
   HANDLE handle; /**< it's set, if the protocol is PIPE or MEMORY */
 #endif

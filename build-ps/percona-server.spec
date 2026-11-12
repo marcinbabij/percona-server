@@ -288,6 +288,7 @@ Obsoletes:      mariadb-server-utils mariadb11.8-server-utils
 Obsoletes:      mariadb-galera-server mariadb11.8-galera-server
 Obsoletes:      mariadb-gssapi-server mariadb11.8-gssapi-server
 Obsoletes:      mariadb-oqgraph-engine mariadb11.8-oqgraph-engine
+Obsoletes:      mariadb-client-utils mariadb11.8-client-utils
 Obsoletes:      mysql8.4-server < 99
 Obsoletes:      mysql8.4 < 99
 Obsoletes:      mysql8.4-common < 99
@@ -830,17 +831,9 @@ rm -f %{buildroot}%{_datadir}/percona-server/audit_log_filter_win_install.sql
 rm -rf %{buildroot}%{_bindir}/mysql_embedded
 rm -rf %{buildroot}/usr/cmake/coredumper-relwithdebinfo.cmake
 rm -rf %{buildroot}/usr/cmake/coredumper.cmake
-rm -rf %{buildroot}/usr/include/kmip.h
-rm -rf %{buildroot}/usr/include/kmippp.h
-rm -rf %{buildroot}/usr/lib/libkmip.a
-rm -rf %{buildroot}/usr/lib/libkmippp.a
-# libkmip PR #30 (PS-10970, picked up via the extra/libkmip submodule
-# bump) restructured the library into kmipclient + kmipcore, which
-# install libkmipclient.a / libkmipcore.a instead of the old
-# libkmip.a / libkmippp.a. These static libs are build-only; drop them
-# so they don't trip the unpackaged-files check.
-rm -rf %{buildroot}/usr/lib/libkmipclient.a
-rm -rf %{buildroot}/usr/lib/libkmipcore.a
+# extra/libkmip (kmipcore, kmipclient, kmiputil) installs nothing here:
+# vendored with add_subdirectory(), its KMIPCLIENT_INSTALL defaults to OFF,
+# and component_keyring_kmip.so links it statically.
 %if 0%{?tokudb}
   rm -f %{buildroot}%{_prefix}/README.md
   rm -f %{buildroot}%{_prefix}/COPYING.AGPLv3
@@ -1135,6 +1128,7 @@ fi
 %attr(755, root, root) %{_bindir}/ps_mysqld_helper
 %attr(755, root, root) %{_bindir}/perror
 %attr(755, root, root) %{_bindir}/ps-admin
+%attr(755, root, root) %{_bindir}/create_id_token
 %if 0%{?systemd}
 %attr(755, root, root) %{_bindir}/mysqld_pre_systemd
 %attr(755, root, root) %{_bindir}/mysqld_safe
@@ -1233,7 +1227,8 @@ fi
 %attr(755, root, root) %{_libdir}/mysql/private/libabsl_time.so
 %attr(755, root, root) %{_libdir}/mysql/private/libabsl_time_zone.so
 %if 0%{?add_fido_plugins}
-%attr(755, root, root) %{_libdir}/mysql/private/libfido2.so.*
+%attr(755, root, root) %{_libdir}/mysql/private/libfido2.so.1.15.0
+%{_libdir}/mysql/private/libfido2.so.1
 %endif # add_fido_plugins
 
 %dir %{_libdir}/mysql/plugin
@@ -1290,6 +1285,7 @@ fi
 %endif
 %attr(755, root, root) %{_libdir}/mysql/plugin/component_test_server_telemetry_metrics.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/component_keyring_file.so
+%attr(755, root, root) %{_libdir}/mysql/plugin/component_percona_keyring_encrypted_file.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/component_test_execute_prepared_statement.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/component_test_execute_regular_statement.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/component_test_mysql_signal_handler.so
@@ -1344,6 +1340,7 @@ fi
 %attr(755, root, root) %{_libdir}/mysql/plugin/debug/component_test_server_telemetry_logs_export.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/debug/component_audit_log_filter.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/debug/component_keyring_file.so
+%attr(755, root, root) %{_libdir}/mysql/plugin/debug/component_percona_keyring_encrypted_file.so
 %if 0%{?rhel} >= 8 || 0%{?amzn} >= 2023
 %attr(755, root, root) %{_libdir}/mysql/plugin/debug/authentication_webauthn_client.so
 %endif
@@ -1454,6 +1451,10 @@ fi
 %attr(755, root, root) %{_libdir}/mysql/plugin/authentication_oci_client.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/debug/component_keyring_kmip.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/debug/authentication_oci_client.so
+%attr(755, root, root) %{_libdir}/mysql/plugin/auth_openid_connect.so
+%attr(755, root, root) %{_libdir}/mysql/plugin/authentication_openid_connect_client.so
+%attr(755, root, root) %{_libdir}/mysql/plugin/debug/auth_openid_connect.so
+%attr(755, root, root) %{_libdir}/mysql/plugin/debug/authentication_openid_connect_client.so
 
 
 %files -n percona-server-client

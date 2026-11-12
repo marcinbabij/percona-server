@@ -30,11 +30,14 @@
 #include <sstream>
 #include <string>
 
+#include "my_compiler.h"
 #include "mysql/components/my_service.h"
 #include "mysql/components/services/mysql_admin_session.h"
 #include "mysql/plugin.h"
 #include "mysql/service_command.h"
 #include "sql/debug_sync.h"
+#include "sql/sql_class.h"
+#include "sql/system_variables.h"
 
 #include "plugin/x/src/helper/get_system_variable.h"
 #include "plugin/x/src/module_mysqlx.h"
@@ -279,6 +282,7 @@ ngs::Error_code Sql_data_context::authenticate_internal(
   ngs::Error_code switch_error = switch_to_user(user, host, ip, db);
 
   if (error.error == ER_MUST_CHANGE_PASSWORD_LOGIN) {
+    force_password_expired();
     m_password_expired = true;
 
     // password is expired, client doesn't support it and server wants us to
@@ -389,6 +393,16 @@ bool get_security_context_value(MYSQL_THD thd, const char *option,
   return false == security_context_get_option(scontext, option, result);
 }
 
+template <typename Result_type>
+bool set_security_context_value(MYSQL_THD thd, const char *option,
+                                Result_type *result) {
+  MYSQL_SECURITY_CONTEXT scontext;
+
+  if (thd_get_security_context(thd, &scontext)) return false;
+
+  return false == security_context_set_option(scontext, option, result);
+}
+
 bool Sql_data_context::is_acl_disabled() {
   MYSQL_LEX_CSTRING value{"", 0};
 
@@ -397,6 +411,12 @@ bool Sql_data_context::is_acl_disabled() {
   }
 
   return false;
+}
+
+void Sql_data_context::force_password_expired() {
+  my_svc_bool value{true};
+
+  set_security_context_value(get_thd(), "password_expired", &value);
 }
 
 bool Sql_data_context::has_authenticated_user_a_super_priv() const {
@@ -658,7 +678,19 @@ ngs::Error_code Sql_data_context::execute_server_command(
   return is_killed() ? ngs::Fatal(error) : error;
 }
 
-bool Sql_data_context::is_sql_mode_set(const std::string &mode) {
+// UBSAN vptr instrumentation emits a THD RTTI reference, but xplugin_unit_tests
+// links libmysqlx without the server THD typeinfo.
+bool Sql_data_context::is_sql_mode_set(const std::string &mode) SUPPRESS_UBSAN {
+  if (mode == "NO_BACKSLASH_ESCAPES") {
+    // This mode is checked by X Plugin query builders while preparing SQL
+    // literals. Read it directly from THD to avoid executing SELECT @@sql_mode:
+    // get_system_variable() logs an error if SQL cannot be executed in the
+    // current session state.
+    const auto thd = get_thd();
+    return thd != nullptr &&
+           (thd->variables.sql_mode & MODE_NO_BACKSLASH_ESCAPES) != 0;
+  }
+
   std::string modes;
   get_system_variable<std::string>(this, "sql_mode", &modes);
   std::istringstream str(modes);

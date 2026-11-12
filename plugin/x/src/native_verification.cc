@@ -36,13 +36,19 @@ namespace xpl {
 
 bool Native_verification::verify_authentication_string(
     const std::string &user, const std::string &host,
-    const std::string &client_string, const std::string &db_string) const {
+    const std::string &client_string, const std::string &db_string,
+    const bool can_update_cache [[maybe_unused]]) const {
   if (client_string.empty()) return db_string.empty();
 
   if (db_string.empty()) return false;
 
 #if !defined(WITHOUT_MYSQL_NATIVE_PASSWORD) || \
     WITHOUT_MYSQL_NATIVE_PASSWORD == 0
+  if (client_string.size() != SCRAMBLED_PASSWORD_CHAR_LENGTH ||
+      db_string.size() != SCRAMBLED_PASSWORD_CHAR_LENGTH ||
+      client_string[0] != '*' || db_string[0] != '*')
+    return false;
+
   uint8_t db_hash[SCRAMBLE_LENGTH + 1] = {0};
   uint8_t user_hash[SCRAMBLE_LENGTH + 1] = {0};
   ::get_salt_from_password(db_hash, db_string.c_str());

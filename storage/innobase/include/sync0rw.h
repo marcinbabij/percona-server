@@ -42,7 +42,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #define sync0rw_h
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
+#include <mutex>
 
 #include "univ.i"
 #ifndef UNIV_HOTBACKUP
@@ -126,6 +128,19 @@ extern ib_mutex_t rw_lock_list_mutex;
  @param[in] clocation location where created */
 void rw_lock_create_func(rw_lock_t *lock,
                          IF_DEBUG(latch_id_t id, ) ut::Location clocation);
+
+/** Initializes an rw-lock object but does NOT register it in the global
+ rw_lock_list. The caller is responsible for registering it later,
+ e.g. in bulk via rw_lock_list_register_bulk(). This lets callers that
+ create many rw-locks (such as buffer pool blocks) avoid taking
+ rw_lock_list_mutex once per lock.
+ @param[in] lock pointer to memory
+ @param[in] id latch_id (debug builds only)
+ @param[in] clocation location where created */
+void rw_lock_create_unregistered_func(rw_lock_t *lock,
+                                      IF_DEBUG(latch_id_t id, )
+                                          ut::Location clocation);
+
 /** Calling this function is obligatory only if the memory buffer containing
  the rw-lock is freed. Removes an rw-lock object from the global list. The
  rw-lock is checked to be in the non-locked state. */
@@ -173,8 +188,7 @@ immediately.
 @param[in]      pass    pass value; != 0, if the lock will be passed to another
                         thread to unlock
 @param[in,out]  lock    rw-lock */
-static inline void rw_lock_s_unlock_func(IF_DEBUG(ulint pass, )
-                                             rw_lock_t *lock);
+static inline void rw_lock_s_unlock_func(ulint pass, rw_lock_t *lock);
 
 /** NOTE! Use the corresponding macro, not directly this function! Lock an
 rw-lock in exclusive mode for the current thread. If the rw-lock is locked
@@ -216,15 +230,13 @@ void rw_lock_sx_lock_func(rw_lock_t *lock, ulint pass, ut::Location location);
 @param[in]      pass    pass value; != 0, if the lock will be passed to another
                         thread to unlock
 @param[in,out]  lock    rw-lock */
-static inline void rw_lock_x_unlock_func(IF_DEBUG(ulint pass, )
-                                             rw_lock_t *lock);
+static inline void rw_lock_x_unlock_func(ulint pass, rw_lock_t *lock);
 
 /** Releases an sx mode lock.
 @param[in]      pass    pass value; != 0, if the lock will be passed to another
                         thread to unlock
 @param[in,out]  lock    rw-lock */
-static inline void rw_lock_sx_unlock_func(IF_DEBUG(ulint pass, )
-                                              rw_lock_t *lock);
+static inline void rw_lock_sx_unlock_func(ulint pass, rw_lock_t *lock);
 
 /** This function is used in the insert buffer to move the ownership of an
 x-latch on a buffer frame to the current thread. The x-latch was set by
@@ -405,12 +417,10 @@ struct rw_lock_t
 
   /** Thread id of writer thread. Is only guaranteed to have non-stale value if
   recursive flag is set, otherwise it may contain native thread ID of a
-  thread which already released or passed the lock. */
+  thread which already released or passed the lock. Recursive X/SX and
+  rw_lock_x_lock_move_ownership() depend on this field. S holders are not
+  stored here; they live in the per-thread slot list. */
   std::atomic<std::thread::id> writer_thread;
-
-  /** XOR of reader threads' IDs. If there is exactly one reader it should allow
-   to retrieve the thread ID of that reader. */
-  Atomic_xor_of_thread_id reader_thread;
 
   /** Used by sync0arr.cc for thread queueing */
   os_event_t event;
@@ -422,20 +432,8 @@ struct rw_lock_t
   /** Location where lock created */
   ut::Location clocation;
 
-  /** last s-lock file/line is not guaranteed to be correct */
-  const char *last_s_file_name;
-
-  /** File name where last x-locked */
-  const char *last_x_file_name;
-
   /** If 1 then the rw-lock is a block lock */
   bool is_block_lock;
-
-  /** Line number where last time s-locked */
-  uint16_t last_s_line;
-
-  /** Line number where last time x-locked */
-  uint16_t last_x_line;
 
   /** Count of os_waits. May not be accurate */
   uint32_t count_os_wait;
@@ -517,6 +515,19 @@ static inline void pfs_rw_lock_create_func(mysql_pfs_key_t key, rw_lock_t *lock,
                                            IF_DEBUG(latch_id_t id, )
                                                ut::Location clocation);
 
+/** Performance schema instrumented wrap function for
+rw_lock_create_unregistered_func(). Behaves like pfs_rw_lock_create_func() but
+defers registration of the lock in the global rw_lock_list to the caller. NOTE!
+Please use the corresponding macro rw_lock_create_unregistered(), not directly
+this function!
+@param[in]      key             key registered with performance schema
+@param[in]      lock            rw lock
+@param[in]      id              latch_id
+@param[in]      clocation       location where created */
+static inline void pfs_rw_lock_create_unregistered_func(
+    mysql_pfs_key_t key, rw_lock_t *lock,
+    IF_DEBUG(latch_id_t id, ) ut::Location clocation);
+
 /** Performance schema instrumented wrap function for rw_lock_x_lock_func()
 NOTE! Please use the corresponding macro rw_lock_x_lock(), not directly this
 function!
@@ -574,8 +585,7 @@ function!
  @param[in]     pass    pass value; != 0, if the lock may have been passed to
                         another thread to unlock
  @param[in,out] lock    rw-lock */
-static inline void pfs_rw_lock_s_unlock_func(IF_DEBUG(ulint pass, )
-                                                 rw_lock_t *lock);
+static inline void pfs_rw_lock_s_unlock_func(ulint pass, rw_lock_t *lock);
 
 /** Performance schema instrumented wrap function for rw_lock_x_unlock_func()
 NOTE! Please use the corresponding macro rw_lock_x_unlock(), not directly this
@@ -583,8 +593,7 @@ function!
 @param[in]      pass    pass value; != 0, if the lock may have been passed to
 another thread to unlock
 @param[in,out]  lock    rw-lock */
-static inline void pfs_rw_lock_x_unlock_func(IF_DEBUG(ulint pass, )
-                                                 rw_lock_t *lock);
+static inline void pfs_rw_lock_x_unlock_func(ulint pass, rw_lock_t *lock);
 
 /** Performance schema instrumented wrap function for rw_lock_sx_lock_func()
 NOTE! Please use the corresponding macro rw_lock_sx_lock(), not directly this
@@ -612,8 +621,7 @@ function!
 @param[in]      pass            pass value; != 0, if the lock will be passed to
 another thread to unlock
 @param[in,out]  lock            pointer to rw-lock */
-static inline void pfs_rw_lock_sx_unlock_func(IF_DEBUG(ulint pass, )
-                                                  rw_lock_t *lock);
+static inline void pfs_rw_lock_sx_unlock_func(ulint pass, rw_lock_t *lock);
 
 /** Performance schema instrumented wrap function for rw_lock_free_func()
  NOTE! Please use the corresponding macro rw_lock_free(), not directly
@@ -631,8 +639,12 @@ static inline void pfs_rw_lock_free_func(rw_lock_t *lock); /*!< in: rw-lock */
 #ifdef UNIV_DEBUG
 #define rw_lock_create(K, L, ID) \
   rw_lock_create_func((L), (ID), UT_LOCATION_HERE)
+#define rw_lock_create_unregistered(K, L, ID) \
+  rw_lock_create_unregistered_func((L), (ID), UT_LOCATION_HERE)
 #else /* UNIV_DEBUG */
 #define rw_lock_create(K, L, ID) rw_lock_create_func((L), UT_LOCATION_HERE)
+#define rw_lock_create_unregistered(K, L, ID) \
+  rw_lock_create_unregistered_func((L), UT_LOCATION_HERE)
 #endif /* UNIV_DEBUG */
 
 /** NOTE! The following macros should be used in rw locking and
@@ -650,15 +662,9 @@ static inline bool rw_lock_s_lock_nowait(rw_lock_t *M, ut::Location L) {
   return rw_lock_s_lock_low(M, 0, L);
 }
 
-#ifdef UNIV_DEBUG
 static inline void rw_lock_s_unlock_gen(rw_lock_t *L, ulint P) {
   rw_lock_s_unlock_func(P, L);
 }
-#else
-static inline void rw_lock_s_unlock_gen(rw_lock_t *L, ulint P) {
-  rw_lock_s_unlock_func(L);
-}
-#endif /* UNIV_DEBUG */
 
 static inline void rw_lock_sx_lock(rw_lock_t *L, ut::Location Loc) {
   rw_lock_sx_lock_func(L, 0, Loc);
@@ -673,21 +679,12 @@ static inline bool rw_lock_sx_lock_nowait(rw_lock_t *M, ulint P,
   return rw_lock_sx_lock_low(M, P, L);
 }
 
-#ifdef UNIV_DEBUG
 static inline void rw_lock_sx_unlock(rw_lock_t *L) {
   rw_lock_sx_unlock_func(0, L);
 }
 static inline void rw_lock_sx_unlock_gen(rw_lock_t *L, ulint P) {
   rw_lock_sx_unlock_func(P, L);
 }
-#else  /* UNIV_DEBUG */
-static inline void rw_lock_sx_unlock(rw_lock_t *L) {
-  rw_lock_sx_unlock_func(L);
-}
-static inline void rw_lock_sx_unlock_gen(rw_lock_t *L, ulint P) {
-  rw_lock_sx_unlock_func(L);
-}
-#endif /* UNIV_DEBUG */
 
 static inline void rw_lock_x_lock(rw_lock_t *M, ut::Location L) {
   rw_lock_x_lock_func(M, 0, L);
@@ -701,15 +698,9 @@ static inline bool rw_lock_x_lock_nowait(rw_lock_t *M, ut::Location L) {
   return rw_lock_x_lock_func_nowait(M, L);
 }
 
-#ifdef UNIV_DEBUG
 static inline void rw_lock_x_unlock_gen(rw_lock_t *L, ulint P) {
   rw_lock_x_unlock_func(P, L);
 }
-#else
-static inline void rw_lock_x_unlock_gen(rw_lock_t *L, ulint P) {
-  rw_lock_x_unlock_func(L);
-}
-#endif
 
 #define rw_lock_free(M) rw_lock_free_func(M)
 
@@ -719,9 +710,13 @@ static inline void rw_lock_x_unlock_gen(rw_lock_t *L, ulint P) {
 #ifdef UNIV_DEBUG
 #define rw_lock_create(K, L, ID) \
   pfs_rw_lock_create_func((K), (L), (ID), UT_LOCATION_HERE)
+#define rw_lock_create_unregistered(K, L, ID) \
+  pfs_rw_lock_create_unregistered_func((K), (L), (ID), UT_LOCATION_HERE)
 #else /* UNIV_DEBUG */
 #define rw_lock_create(K, L, ID) \
   pfs_rw_lock_create_func((K), (L), UT_LOCATION_HERE)
+#define rw_lock_create_unregistered(K, L, ID) \
+  pfs_rw_lock_create_unregistered_func((K), (L), UT_LOCATION_HERE)
 #endif /* UNIV_DEBUG */
 
 /******************************************************************
@@ -740,15 +735,9 @@ static inline bool rw_lock_s_lock_nowait(rw_lock_t *M, ut::Location L) {
   return pfs_rw_lock_s_lock_low(M, 0, L);
 }
 
-#ifdef UNIV_DEBUG
 static inline void rw_lock_s_unlock_gen(rw_lock_t *L, ulint P) {
   pfs_rw_lock_s_unlock_func(P, L);
 }
-#else
-static inline void rw_lock_s_unlock_gen(rw_lock_t *L, ulint P) {
-  pfs_rw_lock_s_unlock_func(L);
-}
-#endif
 
 static inline void rw_lock_sx_lock(rw_lock_t *M, ut::Location L) {
   pfs_rw_lock_sx_lock_func(M, 0, L);
@@ -763,21 +752,12 @@ static inline bool rw_lock_sx_lock_nowait(rw_lock_t *M, ulint P,
   return pfs_rw_lock_sx_lock_low(M, P, L);
 }
 
-#ifdef UNIV_DEBUG
 static inline void rw_lock_sx_unlock(rw_lock_t *L) {
   pfs_rw_lock_sx_unlock_func(0, L);
 }
 static inline void rw_lock_sx_unlock_gen(rw_lock_t *L, ulint P) {
   pfs_rw_lock_sx_unlock_func(P, L);
 }
-#else
-static inline void rw_lock_sx_unlock(rw_lock_t *L) {
-  pfs_rw_lock_sx_unlock_func(L);
-}
-static inline void rw_lock_sx_unlock_gen(rw_lock_t *L, ulint P) {
-  pfs_rw_lock_sx_unlock_func(L);
-}
-#endif
 
 static inline void rw_lock_x_lock(rw_lock_t *M, ut::Location L) {
   pfs_rw_lock_x_lock_func(M, 0, L);
@@ -791,15 +771,9 @@ static inline bool rw_lock_x_lock_nowait(rw_lock_t *M, ut::Location L) {
   return pfs_rw_lock_x_lock_func_nowait(M, L);
 }
 
-#ifdef UNIV_DEBUG
 static inline void rw_lock_x_unlock_gen(rw_lock_t *L, ulint P) {
   pfs_rw_lock_x_unlock_func(P, L);
 }
-#else
-static inline void rw_lock_x_unlock_gen(rw_lock_t *L, ulint P) {
-  pfs_rw_lock_x_unlock_func(L);
-}
-#endif
 
 static inline void rw_lock_free(rw_lock_t *M) { pfs_rw_lock_free_func(M); }
 
@@ -812,6 +786,225 @@ static inline void rw_lock_x_unlock(rw_lock_t *L) {
   rw_lock_x_unlock_gen(L, 0);
 }
 
+/** Per-thread open-addressed table of rw-locks this thread holds, plus the
+registry of those tables. S and X/SX file and line live here. writer_thread
+stays on the lock for recursive X and ownership handoff. */
+class Rw_lock_holders {
+ public:
+  /** Initial open-addressed table. 512 slots hold 256 entries at 50% fill.
+  A thread that passes that grows by doubling, so the common case stays small
+  and a fat LOB mini-transaction gets a larger table instead of a long probe. */
+  static constexpr size_t k_min_cap = 512;
+  /** Hard stop so a leaked slot cannot grow without bound. 50% of this is
+  524288 simultaneous entries. */
+  static constexpr size_t k_max_cap = 1 << 20;
+  static_assert((k_min_cap & (k_min_cap - 1)) == 0);
+  static_assert((k_max_cap & (k_max_cap - 1)) == 0);
+  static_assert(k_min_cap >= 2);
+
+  static Rw_lock_holders &instance();
+
+  /** Record one acquire. pass != 0 is skipped: another thread may unlock.
+  Insert claims the first null bucket on the probe. A recursive acquire of the
+  same lock inserts another entry. */
+  void note(rw_lock_t *lock, ulint pass, ut::Location location, uint8_t mode) {
+    if (pass != 0) {
+      return;
+    }
+    mine().insert(lock, location, mode);
+  }
+
+  /** Drop one matching entry. pass != 0 was not recorded. Walks the probe
+  including across nulls, because a deleted neighbor must not hide this lock.
+  Stops after one lap. */
+  void drop(rw_lock_t *lock, ulint pass, uint8_t mode) {
+    if (pass != 0) {
+      return;
+    }
+    mine().erase_one(lock, mode);
+  }
+
+  [[nodiscard]] bool thread_has_s(std::thread::id thread,
+                                  const rw_lock_t *lock) const;
+  [[nodiscard]] size_t s_count(const rw_lock_t *lock) const;
+  /** Invoke fn(thread id, file, line) for every S holder of lock.
+  fn runs under m_mutex and must not take an InnoDB latch. */
+  template <typename F>
+  void for_each_s(const rw_lock_t *lock, F &&fn) const;
+  /** File and line of one current X or SX holder, if any. */
+  [[nodiscard]] bool writer_location(const rw_lock_t *lock, const char **file,
+                                     uint16_t *line) const;
+
+ private:
+  Rw_lock_holders() = default;
+  Rw_lock_holders(const Rw_lock_holders &) = delete;
+  Rw_lock_holders &operator=(const Rw_lock_holders &) = delete;
+
+  struct Thread_table {
+    struct Slot {
+      rw_lock_t *lock{};
+      const char *file{};
+      uint16_t line{};
+      uint8_t mode{};
+    };
+
+    /** Used until the first grow. Not freed. */
+    Slot inline_slots[k_min_cap]{};
+    /** Heap table after the first grow. Null while slots points at
+    inline_slots. */
+    Slot *heap{};
+    Slot *slots{inline_slots};
+    size_t cap{k_min_cap};
+    std::thread::id id{std::this_thread::get_id()};
+    Thread_table *next{};
+
+    Thread_table() = default;
+    ~Thread_table() { delete[] heap; }
+    Thread_table(const Thread_table &) = delete;
+    Thread_table &operator=(const Thread_table &) = delete;
+
+    static constexpr uint64_t k_mix = 0xb5eb6fbadd39bf9bull;
+
+    [[nodiscard]] size_t bucket(const rw_lock_t *lock) const {
+      const int shift = 64 - std::bit_width(cap - 1);
+      const auto x = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(lock));
+      return static_cast<size_t>((x * k_mix) >> shift);
+    }
+
+    /** Double the table and rehash. Keeps occupancy at or below 50%. */
+    void grow();
+
+    void insert(rw_lock_t *lock, ut::Location location, uint8_t mode) {
+      /* 50% fill. Doubling then leaves the copied entries at 25%. */
+      if (n_used >= cap / 2) {
+        grow();
+      }
+      const auto h = bucket(lock);
+      for (size_t n = 0; n < cap; ++n) {
+        auto &slot = slots[(h + n) & (cap - 1)];
+        if (slot.lock != nullptr) {
+          continue;
+        }
+        slot.lock = lock;
+        slot.file = location.filename;
+        slot.line = static_cast<uint16_t>(location.line);
+        slot.mode = mode;
+        ++n_used;
+        return;
+      }
+      /* Every current holder must be recorded. A missing slot hides it from
+      deadlock detection. */
+      ut_error;
+    }
+
+    void erase_one(rw_lock_t *lock, uint8_t mode) {
+      const auto h = bucket(lock);
+      for (size_t n = 0; n < cap; ++n) {
+        auto &slot = slots[(h + n) & (cap - 1)];
+        if (slot.lock != lock || slot.mode != mode) {
+          continue;
+        }
+        slot.lock = nullptr;
+        if (n_used > 0) {
+          --n_used;
+        }
+        return;
+      }
+      /* note() recorded this acquire. Unlock on this thread must find it. */
+      ut_error;
+    }
+
+    /** Slots occupied in this thread right now. */
+    size_t n_used{};
+  };
+
+  Thread_table &mine();
+
+  void link(Thread_table *table) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    table->next = m_head;
+    m_head = table;
+  }
+
+  void unlink(Thread_table *table) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    Thread_table **link = &m_head;
+    while (*link != nullptr && *link != table) {
+      link = &(*link)->next;
+    }
+    if (*link != nullptr) {
+      *link = table->next;
+    }
+  }
+
+  /** fn runs under m_mutex and must not take an InnoDB latch. m_mutex is
+  std::mutex so a wait here does not re-enter sync-array deadlock detection. */
+  template <typename F>
+  void for_each_slot(F &&fn) const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    for (auto *table = m_head; table != nullptr; table = table->next) {
+      for (size_t i = 0; i < table->cap; ++i) {
+        const auto &slot = table->slots[i];
+        if (slot.lock == nullptr) {
+          continue;
+        }
+        fn(*table, slot);
+      }
+    }
+  }
+
+  mutable std::mutex m_mutex;
+  Thread_table *m_head{};
+};
+
+inline bool Rw_lock_holders::thread_has_s(std::thread::id thread,
+                                          const rw_lock_t *lock) const {
+  bool found = false;
+  for_each_slot([&](const Thread_table &table, const Thread_table::Slot &slot) {
+    if (table.id == thread && slot.lock == lock && slot.mode == RW_LOCK_S) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+template <typename F>
+void Rw_lock_holders::for_each_s(const rw_lock_t *lock, F &&fn) const {
+  for_each_slot([&](const Thread_table &table, const Thread_table::Slot &slot) {
+    if (slot.lock == lock && slot.mode == RW_LOCK_S) {
+      fn(table.id, slot.file, slot.line);
+    }
+  });
+}
+
+inline size_t Rw_lock_holders::s_count(const rw_lock_t *lock) const {
+  size_t n = 0;
+  for_each_slot([&](const Thread_table &, const Thread_table::Slot &slot) {
+    if (slot.lock == lock && slot.mode == RW_LOCK_S) {
+      ++n;
+    }
+  });
+  return n;
+}
+
+inline bool Rw_lock_holders::writer_location(const rw_lock_t *lock,
+                                             const char **file,
+                                             uint16_t *line) const {
+  bool found = false;
+  for_each_slot([&](const Thread_table &, const Thread_table::Slot &slot) {
+    if (found || slot.lock != lock) {
+      return;
+    }
+    if (slot.mode != RW_LOCK_X && slot.mode != RW_LOCK_SX) {
+      return;
+    }
+    *file = slot.file;
+    *line = slot.line;
+    found = true;
+  });
+  return found;
+}
+
 #include "sync0rw.ic"
 
 #endif /* !UNIV_HOTBACKUP */
@@ -820,5 +1013,17 @@ static inline void rw_lock_x_unlock(rw_lock_t *L) {
 typedef UT_LIST_BASE_NODE_T(rw_lock_t, list) rw_lock_list_t;
 
 extern rw_lock_list_t rw_lock_list;
+
+#ifndef UNIV_HOTBACKUP
+/** Registers all rw-locks contained in the given list into the global
+ rw_lock_list under a single rw_lock_list_mutex critical section, in O(1) time.
+ The locks must have been prepared with rw_lock_create_unregistered_func().
+ Takes ownership of the list: the base node is consumed (emptied) as its
+ elements are spliced into rw_lock_list. The rw_lock_t objects themselves are
+ not owned by the list base node (they are embedded elsewhere, e.g. in buffer
+ blocks) and are only re-linked - they remain valid and are not destroyed.
+ @param[in] locks list of locks to register; consumed (emptied) by this call */
+void rw_lock_list_register_bulk(rw_lock_list_t &&locks);
+#endif /* !UNIV_HOTBACKUP */
 
 #endif /* sync0rw.h */

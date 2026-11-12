@@ -23,6 +23,7 @@
 #include "components/audit_log_filter/log_record_formatter.h"
 #include "components/audit_log_filter/log_writer.h"
 #include "components/audit_log_filter/log_writer/file_handle.h"
+#include "components/audit_log_filter/query_output.h"
 #include "components/audit_log_filter/sys_vars.h"
 
 #include <mysql/components/component_implementation.h>
@@ -52,6 +53,8 @@
 #include <array>
 #include <exception>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <variant>
 
 #ifdef WIN32
@@ -75,7 +78,24 @@ SERVICE_TYPE(log_builtins_string) *log_bs = nullptr;
 namespace audit_log_filter {
 namespace {
 
-std::unique_ptr<AuditLogFilter> audit_log_filter;
+/*
+  Deliberately a raw pointer, and deliberately not destroyed when the server
+  goes down without unloading the component.
+
+  If the server terminates early - on an invalid --authentication-policy, say -
+  it never calls audit_log_filter_deinit(), so anything with a non-trivial
+  destructor here would be destroyed during static destruction instead.
+  Destroying AuditLogFilter that late destroys its AuditUdf member, whose
+  destructor calls AuditUdf::deinit() -> SysVars::get_comp_registry_srv(), and
+  the comp_registry_srv static that returns may already have been destroyed
+  itself: that aborts a debug build on the assertion inside
+  get_comp_registry_srv() and is undefined behaviour in a release one
+  (PS-11273).
+
+  Leaking the instance on that path is intentional - the process is on its way
+  out - so please do not turn this back into a smart pointer.
+*/
+AuditLogFilter *audit_log_filter{nullptr};
 
 class EventsConsumer {
  public:
@@ -191,7 +211,7 @@ bool is_stored_program_statement(MYSQL_THD thd) {
 }  // namespace
 
 AuditLogFilter *get_audit_log_filter_instance() noexcept {
-  return audit_log_filter.get();
+  return audit_log_filter;
 }
 
 /*
@@ -388,7 +408,10 @@ mysql_service_status_t audit_log_filter_init() try {
   // Disarm the scope guard only after all potentially-throwing operations
   // succeeded, so that SysVars cleanup still runs on exception.
   comp_registry_srv = nullptr;
-  audit_log_filter = std::move(local_audit_log_filter);
+  // deinit() clears the pointer, so there should be nothing here. Delete
+  // rather than overwrite, so that initializing twice cannot leak.
+  delete audit_log_filter;
+  audit_log_filter = local_audit_log_filter.release();
   return 0;
 } catch (const std::exception &e) {
   LogComponentErr(ERROR_LEVEL, ER_AUDIT_INIT_EXCEPTION, e.what());
@@ -421,7 +444,8 @@ mysql_service_status_t audit_log_filter_deinit() try {
   SysVars::deinit();
   SysVars::release_comp_registry_srv();
 
-  audit_log_filter.reset();
+  delete audit_log_filter;
+  audit_log_filter = nullptr;
 
   return 0;
 } catch (const std::exception &e) {
@@ -682,53 +706,79 @@ int AuditLogFilter::notify_event(audit_event_class_t event_class,
     return 0;
   }
 
-  if (auto rec = std::get_if<AuditRecordGeneral>(&record)) {
-    set_extended_info(thd, sctx, *rec);
+  // An exception during capture, filtering, output preparation or writing
+  // loses the event. Skip and Block returns do not.
+  try {
+    if (auto rec = std::get_if<AuditRecordGeneral>(&record)) {
+      set_extended_info(thd, sctx, *rec);
 
-    if (SysVars::get_event_mode_type() == AuditLogEventModeType::Reduced &&
-        rec->extended_info.command == "Quit") {
+      if (SysVars::get_event_mode_type() == AuditLogEventModeType::Reduced &&
+          rec->extended_info.command == "Quit") {
+        return 0;
+      }
+    }
+
+    if (auto rec = std::get_if<AuditRecordQuery>(&record)) {
+      set_extended_info(thd, sctx, *rec);
+    }
+
+    if (auto rec = std::get_if<AuditRecordMessage>(&record)) {
+      set_extended_info(thd, sctx, *rec);
+    }
+
+    if (auto rec = std::get_if<AuditRecordTableAccess>(&record)) {
+      set_extended_info(thd, sctx, *rec);
+    }
+
+    if (auto rec = std::get_if<AuditRecordParse>(&record)) {
+      // Do not fetch sql_text here: it can rewrite the not-yet-parsed LEX.
+      rec->extended_info.query_charset = get_query_charset(thd);
+    }
+
+    // Apply filtering rule
+    AuditAction filter_result =
+        AuditEventFilter::apply(filter_rule.get(), record);
+
+    if (filter_result == AuditAction::Skip) {
+      SysVars::inc_events_filtered();
       return 0;
     }
-  }
 
-  if (auto rec = std::get_if<AuditRecordQuery>(&record)) {
-    set_extended_info(thd, sctx, *rec);
-  }
+    if (filter_result == AuditAction::Block &&
+        !check_abort_exempt_privilege(sctx)) {
+      auto ev_name = std::visit(
+          [](const auto &rec) -> std::string_view {
+            return rec.event_class_name;
+          },
+          record);
+      LogComponentErr(INFORMATION_LEVEL, ER_AUDIT_BLOCKED_EVENT, ev_name.data(),
+                      event_class);
+      /*
+        Report the abort ourselves. Without this the server falls back to
+        ER_AUDIT_API_ABORT with its generic "Aborted by Audit API ('%s';%d)"
+        text (sql_audit.cc, mysql_audit_notify()), which it only emits when the
+        handler left no error of its own. Keep that error number - it is what
+        the audit API uses for an aborted event - and only give it the wording
+        documented for an audit log filter abort. The blocked event class stays
+        available in the error log through ER_AUDIT_BLOCKED_EVENT above.
+      */
+      my_printf_error(ER_AUDIT_API_ABORT,
+                      "Statement was aborted by an audit log filter.", MYF(0));
+      return 1;
+    }
 
-  if (auto rec = std::get_if<AuditRecordMessage>(&record)) {
-    set_extended_info(thd, sctx, *rec);
-  }
+    if (event_class == audit_event_class_t::AUDIT_CONNECTION_CLASS) {
+      get_connection_attrs(thd, record);
+    }
 
-  if (auto rec = std::get_if<AuditRecordTableAccess>(&record)) {
-    set_extended_info(thd, sctx, *rec);
-  }
-
-  // Apply filtering rule
-  AuditAction filter_result =
-      AuditEventFilter::apply(filter_rule.get(), record);
-
-  if (filter_result == AuditAction::Skip) {
-    SysVars::inc_events_filtered();
-    return 0;
-  }
-
-  if (filter_result == AuditAction::Block &&
-      !check_abort_exempt_privilege(sctx)) {
-    auto ev_name = std::visit(
-        [](const auto &rec) -> std::string_view {
-          return rec.event_class_name;
-        },
-        record);
-    LogComponentErr(INFORMATION_LEVEL, ER_AUDIT_BLOCKED_EVENT, ev_name.data(),
-                    event_class);
-    return 1;
-  }
-
-  if (event_class == audit_event_class_t::AUDIT_CONNECTION_CLASS) {
-    get_connection_attrs(thd, record);
-  }
-
-  try {
+    prepare_query_output(record);
+    DBUG_EXECUTE_IF("audit_log_filter_query_output_not_ready", {
+      std::visit([](auto &rec) { rec.extended_info.query_output.reset(); },
+                 record);
+    });
+    if (!query_output_is_ready(record)) {
+      throw std::runtime_error("Audit query output was not prepared");
+    }
     m_log_writer->write(record);
   } catch (...) {
     SysVars::inc_events_lost();
@@ -989,27 +1039,44 @@ bool AuditLogFilter::get_security_context_option(Security_context_handle &ctx,
   return false;
 }
 
-std::string AuditLogFilter::get_sql_text(MYSQL_THD thd) {
-  if (!thd) return std::string();
+std::optional<std::string> AuditLogFilter::get_sql_text(MYSQL_THD thd) {
+  if (!thd) return std::nullopt;
+  DBUG_EXECUTE_IF("audit_log_filter_query_capture_bad_alloc",
+                  throw std::bad_alloc(););
 
   my_h_string hstr = nullptr;
-  int rc = mysql_service_mysql_thd_attributes->get(thd, "sql_text", &hstr);
-
-  if (rc != 0 || hstr == nullptr) return std::string();
+  const auto destroy = create_scope_guard([&] {
+    if (hstr != nullptr) mysql_service_mysql_string_factory->destroy(hstr);
+  });
+  if (mysql_service_mysql_thd_attributes->get(thd, "sql_text", &hstr) ||
+      hstr == nullptr) {
+    return std::nullopt;
+  }
 
   const char *raw_buffer = nullptr;
   size_t raw_length = 0;
   CHARSET_INFO_h raw_charset = nullptr;
-
   if (mysql_service_mysql_string_get_data_in_charset->get_data(
-          hstr, &raw_buffer, &raw_length, &raw_charset)) {
-    mysql_service_mysql_string_factory->destroy(hstr);
-    return std::string();
+          hstr, &raw_buffer, &raw_length, &raw_charset) ||
+      (raw_buffer == nullptr && raw_length != 0)) {
+    return std::nullopt;
   }
+  // Keep client-charset bytes for filtering (or the password-obfuscated SQL).
+  // The output preparation step converts them; sql_text's binary tag is not
+  // the source charset. Fetch query_charset AFTER this getter can rewrite SQL.
+  return raw_length == 0 ? std::string() : std::string(raw_buffer, raw_length);
+}
 
-  std::string result(raw_buffer, raw_length);
-  mysql_service_mysql_string_factory->destroy(hstr);
-  return result;
+std::string AuditLogFilter::get_query_charset(MYSQL_THD thd) {
+  DBUG_EXECUTE_IF("audit_log_filter_query_charset_bad_alloc",
+                  throw std::bad_alloc(););
+  mysql_cstring_with_length charset{};
+  if (!thd ||
+      mysql_service_mysql_thd_attributes->get(thd, "query_charset", &charset) ||
+      charset.str == nullptr) {
+    return {};
+  }
+  return {charset.str, charset.length};
 }
 
 bool AuditLogFilter::set_extended_info(MYSQL_THD thd,
@@ -1027,6 +1094,7 @@ bool AuditLogFilter::set_extended_info(MYSQL_THD thd,
   auto &extra = record.extended_info;
 
   extra.query = get_sql_text(thd);
+  extra.query_charset = get_query_charset(thd);
 
   mysql_cstring_with_length sql_command;
   if (get_sql_command(thd, sql_command)) {
@@ -1052,9 +1120,11 @@ bool AuditLogFilter::set_extended_info(MYSQL_THD thd,
 
 bool AuditLogFilter::set_extended_info(MYSQL_THD, Security_context_handle sctx,
                                        AuditRecordQuery &record) {
-  if (!sctx) return false;
-
   auto &extra = record.extended_info;
+  if (record.event->query_charset != nullptr) {
+    extra.query_charset = record.event->query_charset;
+  }
+  if (!sctx) return false;
 
   get_security_context_option(sctx, "user", extra.user);
   get_security_context_option(sctx, "host", extra.host);
@@ -1101,6 +1171,7 @@ bool AuditLogFilter::set_extended_info(MYSQL_THD thd,
   auto &extra = record.extended_info;
 
   extra.query = get_sql_text(thd);
+  extra.query_charset = get_query_charset(thd);
 
   mysql_cstring_with_length sql_command;
   if (get_sql_command(thd, sql_command)) {

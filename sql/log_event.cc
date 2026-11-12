@@ -1162,38 +1162,37 @@ bool Log_event::need_checksum() {
             static_cast<enum_binlog_checksum_alg>(binlog_checksum_options)
             : mysql::binlog::event::BINLOG_CHECKSUM_ALG_OFF;
 
-  assert(
-      !ret ||
-      ((common_footer->checksum_alg ==
-            static_cast<enum_binlog_checksum_alg>(binlog_checksum_options) ||
-        /*
-           Stop event closes the relay-log and its checksum alg
-           preference is set by the caller can be different
-           from the server's binlog_checksum_options.
-        */
-        get_type_code() == mysql::binlog::event::STOP_EVENT ||
-        /*
-           Rotate:s can be checksummed regardless of the server's
-           binlog_checksum_options. That applies to both
-           the local RL's Rotate and the master's Rotate
-           which IO thread instantiates via queue_binlog_ver_3_event.
-        */
-        get_type_code() == mysql::binlog::event::ROTATE_EVENT ||
-        /*
-           The previous event has its checksum option defined
-           according to the format description event.
-        */
-        get_type_code() == mysql::binlog::event::PREVIOUS_GTIDS_LOG_EVENT ||
-        /* FD is always checksummed */
-        get_type_code() == mysql::binlog::event::FORMAT_DESCRIPTION_EVENT ||
-        /*
-           View_change_log_event is queued into relay log by the
-           local member, which may have a different checksum algorithm
-           than the one of the event source.
-        */
-        get_type_code() == mysql::binlog::event::VIEW_CHANGE_EVENT) &&
-       common_footer->checksum_alg !=
-           mysql::binlog::event::BINLOG_CHECKSUM_ALG_OFF));
+  assert(!ret ||
+         ((common_footer->checksum_alg ==
+               static_cast<enum_binlog_checksum_alg>(binlog_checksum_options) ||
+           /*
+              Stop event closes the relay-log and its checksum alg
+              preference is set by the caller can be different
+              from the server's binlog_checksum_options.
+           */
+           get_type_code() == mysql::binlog::event::STOP_EVENT ||
+           /*
+              Rotate:s can be checksummed regardless of the server's
+              binlog_checksum_options. That applies to both
+              the local RL's Rotate and the master's Rotate
+              which IO thread instantiates via queue_binlog_ver_3_event.
+           */
+           get_type_code() == mysql::binlog::event::ROTATE_EVENT ||
+           /*
+              The previous event has its checksum option defined
+              according to the format description event.
+           */
+           get_type_code() == mysql::binlog::event::PREVIOUS_GTIDS_LOG_EVENT ||
+           /* FD is always checksummed */
+           get_type_code() == mysql::binlog::event::FORMAT_DESCRIPTION_EVENT ||
+           /*
+              View_change_log_event is queued into relay log by the
+              local member, which may have a different checksum algorithm
+              than the one of the event source.
+           */
+           get_type_code() == mysql::binlog::event::VIEW_CHANGE_EVENT) &&
+          common_footer->checksum_alg !=
+              mysql::binlog::event::BINLOG_CHECKSUM_ALG_OFF));
 
   assert(common_footer->checksum_alg !=
          mysql::binlog::event::BINLOG_CHECKSUM_ALG_UNDEF);
@@ -1539,8 +1538,8 @@ static void my_b_write_bit(IO_CACHE *file, const uchar *ptr, uint nbits) {
   my_b_printf(file, "b'");
   for (bitnum = skip_bits; bitnum < nbits8; bitnum++) {
     const int is_set = (ptr[(bitnum) / 8] >> (7 - bitnum % 8)) & 0x01;
-    [[maybe_unused]]
-    int write_res = my_b_write(file, (const uchar *)(is_set ? "1" : "0"), 1);
+    [[maybe_unused]] int write_res =
+        my_b_write(file, (const uchar *)(is_set ? "1" : "0"), 1);
     assert(write_res == 0);
   }
   my_b_printf(file, "'");
@@ -3695,6 +3694,55 @@ static bool is_sql_require_primary_key_needed(const LEX *lex) {
 }
 
 /**
+  Checks whether the statement represented by the given LEX object
+  is eligible for database-specific access privileges.
+
+  @param lex  pointer to the LEX object representing the statement being
+              executed.
+  @return     true if the command is eligible for database-specific
+              access privileges; false otherwise.
+ */
+bool static is_command_eligible_for_db_specific_privilege(const LEX *lex) {
+  enum enum_sql_command cmd = lex->sql_command;
+  bool ret{false};
+
+  switch (cmd) {
+    case SQLCOM_CREATE_DB:
+    case SQLCOM_CREATE_TABLE:
+    case SQLCOM_CREATE_INDEX:
+    case SQLCOM_ALTER_TABLE:
+    case SQLCOM_TRUNCATE:
+    case SQLCOM_DROP_TABLE:
+    case SQLCOM_DROP_INDEX:
+    case SQLCOM_DROP_DB:
+    case SQLCOM_ALTER_DB:
+    case SQLCOM_OPTIMIZE:
+    case SQLCOM_ANALYZE:
+    case SQLCOM_RENAME_TABLE:
+    case SQLCOM_REPAIR:
+    case SQLCOM_CREATE_EVENT:
+    case SQLCOM_ALTER_EVENT:
+    case SQLCOM_DROP_EVENT:
+    case SQLCOM_CREATE_PROCEDURE:
+    case SQLCOM_DROP_PROCEDURE:
+    case SQLCOM_ALTER_PROCEDURE:
+    case SQLCOM_CREATE_TRIGGER:
+    case SQLCOM_DROP_TRIGGER:
+    case SQLCOM_ALTER_FUNCTION:
+    case SQLCOM_CREATE_FUNCTION:
+    case SQLCOM_DROP_FUNCTION:
+    case SQLCOM_CREATE_SPFUNCTION:
+    case SQLCOM_CREATE_VIEW:
+    case SQLCOM_DROP_VIEW:
+      ret = true;
+      break;
+    default:
+      ret = false;
+  }
+  return ret;
+}
+
+/**
   Returns whether or not the statement held by the `LEX` object parameter
   requires `Q_DEFAULT_TABLE_ENCRYPTION` to be logged together with the
   statement.
@@ -4204,8 +4252,8 @@ void Query_log_event::print_query_header(
   end = my_stpcpy(end, print_event_info->delimiter);
   *end++ = '\n';
   assert(end < buff + sizeof(buff));
-  [[maybe_unused]]
-  int write_res = my_b_write(file, (uchar *)buff, (uint)(end - buff));
+  [[maybe_unused]] int write_res =
+      my_b_write(file, (uchar *)buff, (uint)(end - buff));
   assert(write_res == 0);
   if (!print_event_info->require_row_format &&
       (!print_event_info->thread_id_printed ||
@@ -4372,8 +4420,8 @@ void Query_log_event::print(FILE *, PRINT_EVENT_INFO *print_event_info) const {
   DBUG_EXECUTE_IF("simulate_file_write_error",
                   { head->write_pos = head->write_end - 500; });
   print_query_header(head, print_event_info);
-  [[maybe_unused]]
-  int write_res = my_b_write(head, pointer_cast<const uchar *>(query), q_len);
+  [[maybe_unused]] int write_res =
+      my_b_write(head, pointer_cast<const uchar *>(query), q_len);
   assert(write_res == 0);
   my_b_printf(head, "\n%s\n", print_event_info->delimiter);
 }
@@ -5094,6 +5142,20 @@ int Query_log_event::do_apply_event(Relay_log_info const *rli,
 
       mysql_thread_set_secondary_engine(false);
 
+      {
+        auto f1 = [&]() {
+          Applier_security_context_guard sec_context{rli, thd};
+          if (!sec_context.skip_priv_checks() &&
+              !sec_context.has_access({SUPER_ACL}) &&
+              is_command_eligible_for_db_specific_privilege(thd->lex)) {
+            /* Refresh DB access cache */
+            if (mysql_change_db(thd, thd->db(), true)) return true;
+          }
+          return false;
+        };
+        thd->rpl_thd_ctx.post_filters_actions().push_back(f1);
+      }
+
       /* Execute the query (note that we bypass dispatch_command()) */
       Parser_state parser_state;
       if (!parser_state.init(thd, thd->query().str, thd->query().length)) {
@@ -5459,6 +5521,8 @@ end:
   thd->reset_query();
   thd->lex->sql_command = SQLCOM_END;
   DBUG_PRINT("info", ("end: query= 0"));
+  /* Restore original DB state (no default DB) after privilege refresh */
+  mysql_change_db(thd, NULL_CSTR, true);
 
   /* Mark the statement completed. */
   MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
@@ -5936,9 +6000,8 @@ void Rotate_log_event::print(FILE *, PRINT_EVENT_INFO *print_event_info) const {
   print_header(head, print_event_info, false);
   my_b_printf(head, "\tRotate to ");
   if (new_log_ident) {
-    [[maybe_unused]]
-    int write_res = my_b_write(head, pointer_cast<const uchar *>(new_log_ident),
-                               (uint)ident_len);
+    [[maybe_unused]] int write_res = my_b_write(
+        head, pointer_cast<const uchar *>(new_log_ident), (uint)ident_len);
     assert(write_res == 0);
   }
   my_b_printf(head, "  pos: %s\n", llstr(pos, buf));
@@ -7079,8 +7142,8 @@ void User_var_log_event::print(FILE *,
   quoted_len =
       my_strmov_quoted_identifier((char *)quoted_id, (const char *)name_id);
   quoted_id[quoted_len] = '\0';
-  [[maybe_unused]]
-  int write_res = my_b_write(head, (uchar *)quoted_id, quoted_len);
+  [[maybe_unused]] int write_res =
+      my_b_write(head, (uchar *)quoted_id, quoted_len);
   assert(write_res == 0);
 
   if (is_null) {
@@ -7229,7 +7292,9 @@ int User_var_log_event::do_apply_event(Relay_log_info const *rli) {
         val_len = 8;
         break;
       case DECIMAL_RESULT: {
-        if (val_len < 3) {
+        if (val_len < 3 ||
+            !mysql::binlog::event::is_user_var_decimal_metadata_valid(
+                val, val_len, DECIMAL_MAX_PRECISION, DECIMAL_MAX_SCALE)) {
           rli->report(ERROR_LEVEL, ER_REPLICA_FATAL_ERROR,
                       ER_THD(thd, ER_REPLICA_FATAL_ERROR),
                       "Invalid variable length at User var event");
@@ -8275,16 +8340,16 @@ Rows_log_event::Rows_log_event(
                     /* Check extra data has expected value */
                     check_extra_row_ndb_info(m_extra_row_info.get_ndb_info()););
 
-  /*
-     m_cols and m_cols_ai are of the type MY_BITMAP, which are members of
-     class Rows_log_event, and are used while applying the row events on
-     the slave.
-     The bitmap integer is initialized by copying the contents of the
-     vector column_before_image for m_cols.bitamp, and vector
-     column_after_image for m_cols_ai.bitmap. m_cols_ai is only initialized
-     for UPDATE_ROWS_EVENTS, else it is equal to the before image.
-  */
-  /* if bitmap_init fails, is_valid will be set to false */
+    /*
+       m_cols and m_cols_ai are of the type MY_BITMAP, which are members of
+       class Rows_log_event, and are used while applying the row events on
+       the slave.
+       The bitmap integer is initialized by copying the contents of the
+       vector column_before_image for m_cols.bitamp, and vector
+       column_after_image for m_cols_ai.bitmap. m_cols_ai is only initialized
+       for UPDATE_ROWS_EVENTS, else it is equal to the before image.
+    */
+    /* if bitmap_init fails, is_valid will be set to false */
 #if defined(__GNUC__) && (__GNUC__ >= 14)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
@@ -10471,6 +10536,9 @@ int Rows_log_event::do_apply_event(Relay_log_info const *rli) {
       this->rbr_exec_mode = replica_exec_mode_options;
     else  // set the mode for user thread
       this->rbr_exec_mode = thd->variables.rbr_exec_mode_options;
+    // Lets storage engines skip optimizations that trust the before image,
+    // such as MyRocks read-free replication, in idempotent mode.
+    thd->m_rbr_exec_mode = static_cast<enum_rbr_exec_mode>(rbr_exec_mode);
 
     // Do event specific preparations
     error = do_before_row_operations(rli);
@@ -10531,9 +10599,11 @@ int Rows_log_event::do_apply_event(Relay_log_info const *rli) {
         break;
 
       case ROW_LOOKUP_NOT_NEEDED:
-        assert(get_general_type_code() == mysql::binlog::event::WRITE_ROWS_EVENT ||
-               get_general_type_code() == mysql::binlog::event::DELETE_ROWS_EVENT ||
-               get_general_type_code() == mysql::binlog::event::UPDATE_ROWS_EVENT);
+        assert(
+            get_general_type_code() == mysql::binlog::event::WRITE_ROWS_EVENT ||
+            get_general_type_code() ==
+                mysql::binlog::event::DELETE_ROWS_EVENT ||
+            get_general_type_code() == mysql::binlog::event::UPDATE_ROWS_EVENT);
 
         /* No need to scan for rows, just apply it */
         do_apply_row_ptr = &Rows_log_event::do_apply_row;
@@ -10634,6 +10704,7 @@ int Rows_log_event::do_apply_event(Relay_log_info const *rli) {
       clear_all_errors(thd, const_cast<Relay_log_info *>(rli));
       error = 0;
     }
+    thd->m_rbr_exec_mode = RBR_EXEC_MODE_STRICT;
 
     // reset back the db
     thd->reset_db(current_db_name_saved);
@@ -11024,7 +11095,11 @@ void Rows_log_event::print_helper(FILE *,
 int Table_map_log_event::save_field_metadata() {
   DBUG_TRACE;
   int index = 0;
-  for (auto it = m_column_view->begin(); it != m_column_view->end(); ++it) {
+  for (auto it = m_column_view->begin();
+       it != m_column_view->end() &&
+       DBUG_EVALUATE_IF("binlog_omit_last_column_from_table_map_event",
+                        it.filtered_pos() != this->m_colcnt, true);
+       ++it) {
     Field *field = *it;
     DBUG_PRINT("debug", ("field_type: %d", m_coltype[it.filtered_pos()]));
     index += field->save_field_metadata(&m_field_metadata[index]);
@@ -11157,7 +11232,13 @@ Table_map_log_event::Table_map_log_event(
 
   memset(m_null_bits, 0, num_null_bytes);
   Bit_writer bit_writer{this->m_null_bits};
-  for (auto field : *m_column_view) bit_writer.set(field->is_nullable());
+  for (auto it = m_column_view->begin();
+       it != m_column_view->end() &&
+       DBUG_EVALUATE_IF("binlog_omit_last_column_from_table_map_event",
+                        it.filtered_pos() != this->m_colcnt, true);
+       ++it) {
+    bit_writer.set((*it)->is_nullable());
+  }
   /*
     Marking event to require sequential execution in MTS
     if the query might have updated FK-referenced db.
@@ -11196,6 +11277,16 @@ Table_map_log_event::Table_map_log_event(
   assert(header()->type_code == mysql::binlog::event::TABLE_MAP_EVENT);
 #ifdef MYSQL_SERVER
   m_column_view = std::make_unique<cs::util::ReplicatedColumnsView>();
+
+  if (common_header->get_is_valid()) {
+    /*
+      Reject malformed TABLE_MAP_EVENT metadata during event parsing before
+      applier processing.
+    */
+    table_def parsed_table_def(m_coltype, m_colcnt, m_field_metadata,
+                               m_field_metadata_size, m_null_bits, m_flags);
+    common_header->set_is_valid(parsed_table_def.is_valid());
+  }
 #endif
 }
 

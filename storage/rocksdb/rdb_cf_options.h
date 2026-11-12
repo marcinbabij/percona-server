@@ -1,5 +1,6 @@
 /*
-   Copyright (c) 2014, SkySQL Ab
+   Portions Copyright (c) 2016-Present, Facebook, Inc.
+   Portions Copyright (c) 2014, SkySQL Ab
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -56,7 +57,7 @@ class Rdb_cf_options {
 
   /* bool true return indicates cf_name was found */
   [[nodiscard]] bool get(const std::string &cf_name,
-                        rocksdb::ColumnFamilyOptions *const opts);
+                         rocksdb::ColumnFamilyOptions *const opts);
 
   void update(const std::string &cf_name, const std::string &cf_options);
 

@@ -28,9 +28,13 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #define UT0COUNTER_H
 
 #include <string.h>
-#include "my_dbug.h"
 #include <cassert>
 #include <cstdint>
+#include "my_dbug.h"
+
+#ifndef __WIN__
+#include <pthread.h>
+#endif
 
 /** CPU cache line size */
 #define INNOBASE_CACHE_LINE_SIZE 64

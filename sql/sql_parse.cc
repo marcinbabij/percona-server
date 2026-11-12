@@ -664,6 +664,7 @@ void init_sql_command_flags() {
   sql_command_flags[SQLCOM_SHOW_ERRORS] =
       CF_STATUS_COMMAND | CF_DIAGNOSTIC_STMT;
   sql_command_flags[SQLCOM_SHOW_ENGINE_STATUS] = CF_STATUS_COMMAND;
+  sql_command_flags[SQLCOM_SHOW_ENGINE_TRX] = CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_ENGINE_MUTEX] = CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_ENGINE_LOGS] = CF_STATUS_COMMAND;
   sql_command_flags[SQLCOM_SHOW_PROCESSLIST] = CF_STATUS_COMMAND;
@@ -960,6 +961,7 @@ void init_sql_command_flags() {
   sql_command_flags[SQLCOM_SHOW_STATUS] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_SHOW_ENGINE_LOGS] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_SHOW_ENGINE_STATUS] |= CF_ALLOW_PROTOCOL_PLUGIN;
+  sql_command_flags[SQLCOM_SHOW_ENGINE_TRX] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_SHOW_ENGINE_MUTEX] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_SHOW_PROCESSLIST] |= CF_ALLOW_PROTOCOL_PLUGIN;
   sql_command_flags[SQLCOM_SHOW_BINLOG_STATUS] |= CF_ALLOW_PROTOCOL_PLUGIN;
@@ -4952,6 +4954,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_SHOW_ENGINE_LOGS:
     case SQLCOM_SHOW_ENGINE_MUTEX:
     case SQLCOM_SHOW_ENGINE_STATUS:
+    case SQLCOM_SHOW_ENGINE_TRX:
     case SQLCOM_SHOW_ERRORS:
     case SQLCOM_SHOW_EVENTS:
     case SQLCOM_SHOW_FIELDS:
@@ -6508,11 +6511,10 @@ Table_ref *Query_block::add_table_to_list(
     // threads since this is expected by the mysql_upgrade utility.
     if (!(lex->sql_command == SQLCOM_CREATE_VIEW &&
           dd::get_dictionary()->is_system_view_name(
-              lex->query_tables->db, lex->query_tables->table_name))
-&& !(dd::get_dictionary()->is_system_view_name(
-              lex->query_tables->db, lex->query_tables->table_name)
- && DBUG_EVALUATE_IF("skip_dd_table_access_check", true, false))
-        ) {
+              lex->query_tables->db, lex->query_tables->table_name)) &&
+        !(dd::get_dictionary()->is_system_view_name(
+              lex->query_tables->db, lex->query_tables->table_name) &&
+          DBUG_EVALUATE_IF("skip_dd_table_access_check", true, false))) {
       my_error(ER_NO_SYSTEM_TABLE_ACCESS, MYF(0),
                ER_THD_NONCONST(thd, dictionary->table_type_error_code(
                                         ptr->db, ptr->table_name)),

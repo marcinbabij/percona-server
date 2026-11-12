@@ -26,5 +26,5 @@ MYSQL_ADD_EXECUTABLE(rdb_clone-t rdb_clone-t.cc
   DEPENDENCIES GenError
   ENABLE_EXPORTS
   SKIP_INSTALL
-  LINK_LIBRARIES gunit_small rocksdb_sources
+  LINK_LIBRARIES gunit_small rocksdb_sources ext::icu
   )
